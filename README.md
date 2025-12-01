@@ -30,7 +30,6 @@ xterm.js is everywhere—VS Code, Hyper, countless web terminals. But it has fun
 
 | Issue                                    | xterm.js                                                            | ghostty-web                |
 | ---------------------------------------- | ------------------------------------------------------------------- | -------------------------- |
-| **RTL languages**                        | [Broken since 2017](https://github.com/xtermjs/xterm.js/issues/701) | ✓ Works                    |
 | **Complex scripts** (Devanagari, Arabic) | Rendering issues                                                    | ✓ Proper grapheme handling |
 | **XTPUSHSGR/XTPOPSGR**                   | [Not supported](https://github.com/xtermjs/xterm.js/issues/2570)    | ✓ Full support             |
 
