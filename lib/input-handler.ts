@@ -169,6 +169,10 @@ export class InputHandler {
   private keydownListener: ((e: KeyboardEvent) => void) | null = null;
   private keypressListener: ((e: KeyboardEvent) => void) | null = null;
   private pasteListener: ((e: ClipboardEvent) => void) | null = null;
+  private compositionStartListener: ((e: CompositionEvent) => void) | null = null;
+  private compositionUpdateListener: ((e: CompositionEvent) => void) | null = null;
+  private compositionEndListener: ((e: CompositionEvent) => void) | null = null;
+  private isComposing = false;
   private isDisposed = false;
 
   /**
@@ -233,6 +237,15 @@ export class InputHandler {
 
     this.pasteListener = this.handlePaste.bind(this);
     this.container.addEventListener('paste', this.pasteListener);
+
+    this.compositionStartListener = this.handleCompositionStart.bind(this);
+    this.container.addEventListener('compositionstart', this.compositionStartListener);
+
+    this.compositionUpdateListener = this.handleCompositionUpdate.bind(this);
+    this.container.addEventListener('compositionupdate', this.compositionUpdateListener);
+
+    this.compositionEndListener = this.handleCompositionEnd.bind(this);
+    this.container.addEventListener('compositionend', this.compositionEndListener);
   }
 
   /**
@@ -286,6 +299,12 @@ export class InputHandler {
    */
   private handleKeyDown(event: KeyboardEvent): void {
     if (this.isDisposed) return;
+
+    // Ignore keydown events during composition
+    // Note: Some browsers send keyCode 229 for all keys during composition
+    if (this.isComposing || event.isComposing || event.keyCode === 229) {
+      return;
+    }
 
     // Emit onKey event first (before any processing)
     if (this.onKeyCallback) {
@@ -494,6 +513,50 @@ export class InputHandler {
   }
 
   /**
+   * Handle compositionstart event
+   */
+  private handleCompositionStart(_event: CompositionEvent): void {
+    if (this.isDisposed) return;
+    this.isComposing = true;
+  }
+
+  /**
+   * Handle compositionupdate event
+   */
+  private handleCompositionUpdate(_event: CompositionEvent): void {
+    if (this.isDisposed) return;
+    // We could track the current composition string here if we wanted to
+    // display it in a custom way, but for now we rely on the browser's
+    // input method editor UI.
+  }
+
+  /**
+   * Handle compositionend event
+   */
+  private handleCompositionEnd(event: CompositionEvent): void {
+    if (this.isDisposed) return;
+    this.isComposing = false;
+
+    const data = event.data;
+    if (data && data.length > 0) {
+      this.onDataCallback(data);
+    }
+
+    // Cleanup text nodes in container (fix for duplicate text display)
+    // When the container is contenteditable, the browser might insert text nodes
+    // upon composition end. We need to remove them to prevent duplicate display.
+    if (this.container && this.container.childNodes) {
+      for (let i = this.container.childNodes.length - 1; i >= 0; i--) {
+        const node = this.container.childNodes[i];
+        // Node.TEXT_NODE === 3
+        if (node.nodeType === 3) {
+          this.container.removeChild(node);
+        }
+      }
+    }
+  }
+
+  /**
    * Dispose the InputHandler and remove event listeners
    */
   dispose(): void {
@@ -512,6 +575,21 @@ export class InputHandler {
     if (this.pasteListener) {
       this.container.removeEventListener('paste', this.pasteListener);
       this.pasteListener = null;
+    }
+
+    if (this.compositionStartListener) {
+      this.container.removeEventListener('compositionstart', this.compositionStartListener);
+      this.compositionStartListener = null;
+    }
+
+    if (this.compositionUpdateListener) {
+      this.container.removeEventListener('compositionupdate', this.compositionUpdateListener);
+      this.compositionUpdateListener = null;
+    }
+
+    if (this.compositionEndListener) {
+      this.container.removeEventListener('compositionend', this.compositionEndListener);
+      this.compositionEndListener = null;
     }
 
     this.isDisposed = true;

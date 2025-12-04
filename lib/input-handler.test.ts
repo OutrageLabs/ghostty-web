@@ -33,6 +33,9 @@ interface MockClipboardEvent {
 interface MockHTMLElement {
   addEventListener: (event: string, handler: (e: any) => void) => void;
   removeEventListener: (event: string, handler: (e: any) => void) => void;
+  childNodes: Node[];
+  removeChild: (node: Node) => Node;
+  appendChild: (node: Node) => Node;
 }
 
 // Helper to create mock keyboard event
@@ -76,7 +79,25 @@ function createClipboardEvent(text: string | null): MockClipboardEvent {
     stopPropagation: mock(() => {}),
   };
 }
+interface MockCompositionEvent {
+  type: string;
+  data: string | null;
+  preventDefault: () => void;
+  stopPropagation: () => void;
+}
 
+// Helper to create mock composition event
+function createCompositionEvent(
+  type: 'compositionstart' | 'compositionupdate' | 'compositionend',
+  data: string | null
+): MockCompositionEvent {
+  return {
+    type,
+    data,
+    preventDefault: mock(() => {}),
+    stopPropagation: mock(() => {}),
+  };
+}
 // Helper to create mock container
 function createMockContainer(): MockHTMLElement & {
   _listeners: Map<string, ((e: any) => void)[]>;
@@ -106,6 +127,19 @@ function createMockContainer(): MockHTMLElement & {
       for (const handler of handlers) {
         handler(event);
       }
+    },
+    // Mock childNodes and removeChild for text node cleanup test
+    childNodes: [] as Node[],
+    removeChild(node: Node) {
+      const index = this.childNodes.indexOf(node);
+      if (index >= 0) {
+        this.childNodes.splice(index, 1);
+      }
+      return node;
+    },
+    appendChild(node: Node) {
+      this.childNodes.push(node);
+      return node;
     },
   };
 }
@@ -266,6 +300,104 @@ describe('InputHandler', () => {
 
       simulateKey(container, createKeyEvent('Space', ' '));
       expect(dataReceived).toEqual([' ']);
+    });
+  });
+
+  describe('IME Composition', () => {
+    test('handles composition sequence', () => {
+      const handler = new InputHandler(
+        ghostty,
+        container as any,
+        (data) => dataReceived.push(data),
+        () => {
+          bellCalled = true;
+        }
+      );
+
+      // Start composition
+      const startEvent = createCompositionEvent('compositionstart', '');
+      container.dispatchEvent(startEvent);
+
+      // Update composition (typing)
+      const updateEvent1 = createCompositionEvent('compositionupdate', 'n');
+      container.dispatchEvent(updateEvent1);
+
+      // Keydown events during composition should be ignored
+      const keyEvent1 = createKeyEvent('KeyN', 'n');
+      Object.defineProperty(keyEvent1, 'isComposing', { value: true });
+      simulateKey(container, keyEvent1);
+
+      // Update composition (more typing)
+      const updateEvent2 = createCompositionEvent('compositionupdate', 'ni');
+      container.dispatchEvent(updateEvent2);
+
+      // End composition (commit)
+      const endEvent = createCompositionEvent('compositionend', '你好');
+      container.dispatchEvent(endEvent);
+
+      // Should only receive the final committed text
+      expect(dataReceived).toEqual(['你好']);
+    });
+
+    test('ignores keydown during composition', () => {
+      const handler = new InputHandler(
+        ghostty,
+        container as any,
+        (data) => dataReceived.push(data),
+        () => {
+          bellCalled = true;
+        }
+      );
+
+      // Start composition
+      container.dispatchEvent(createCompositionEvent('compositionstart', ''));
+
+      // Simulate keydown with isComposing=true
+      const keyEvent = createKeyEvent('KeyA', 'a');
+      Object.defineProperty(keyEvent, 'isComposing', { value: true });
+      simulateKey(container, keyEvent);
+
+      // Simulate keydown with keyCode 229
+      const keyEvent229 = createKeyEvent('KeyB', 'b');
+      Object.defineProperty(keyEvent229, 'keyCode', { value: 229 });
+      simulateKey(container, keyEvent229);
+
+      // Should not receive any data
+      expect(dataReceived.length).toBe(0);
+
+      // End composition
+      container.dispatchEvent(createCompositionEvent('compositionend', 'a'));
+      expect(dataReceived).toEqual(['a']);
+    });
+
+    test('cleans up text nodes in container after composition', () => {
+      const handler = new InputHandler(
+        ghostty,
+        container as any,
+        (data) => dataReceived.push(data),
+        () => {
+          bellCalled = true;
+        }
+      );
+
+      // Simulate browser inserting text node during composition
+      const textNode = { nodeType: 3, textContent: '你好' } as Node;
+      container.appendChild(textNode);
+
+      // Also add a non-text node (e.g. canvas) to ensure it's not removed
+      const elementNode = { nodeType: 1, nodeName: 'CANVAS' } as Node;
+      container.appendChild(elementNode);
+
+      expect(container.childNodes.length).toBe(2);
+
+      // End composition
+      const endEvent = createCompositionEvent('compositionend', '你好');
+      container.dispatchEvent(endEvent);
+
+      // Should have removed the text node but kept the element node
+      expect(container.childNodes.length).toBe(1);
+      expect(container.childNodes[0]).toBe(elementNode);
+      expect(dataReceived).toEqual(['你好']);
     });
   });
 
