@@ -1,3 +1,10 @@
+diff --git a/ghostty b/ghostty
+index 5714ed0..b6dbd44 160000
+--- a/ghostty
++++ b/ghostty
+@@ -1 +1 @@
+-Subproject commit 5714ed07a1012573261b7b7e3ed2add9c1504496
++Subproject commit b6dbd445d038c50be168dae81c1ca02da3316b8b
 diff --git a/happydom.ts b/happydom.ts
 index c2b92ee..8bc4dce 100644
 --- a/happydom.ts
