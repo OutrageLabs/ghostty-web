@@ -9,6 +9,7 @@
  */
 
 import type { IBufferRange, ILink, ILinkProvider } from '../types';
+import { openUrl } from '../utils/open-url';
 
 /**
  * URL Regex Provider
@@ -83,7 +84,7 @@ export class UrlRegexProvider implements ILinkProvider {
           activate: (event) => {
             // Open link if Ctrl/Cmd is pressed
             if (event.ctrlKey || event.metaKey) {
-              window.open(url, '_blank', 'noopener,noreferrer');
+              openUrl(url);
             }
           },
         });

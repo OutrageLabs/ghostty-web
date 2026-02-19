@@ -1,0 +1,1036 @@
+/**
+ * Beamterm Renderer Adapter
+ *
+ * Adapter between ghostty-web and @kofany/beamterm-terx (Subterm renderer).
+ * Converts GhosttyCell -> beamterm batch API.
+ */
+
+import {
+  main as initBeamterm,
+  style,
+  cell,
+  BeamtermRenderer,
+  SelectionMode,
+  ModifierKeys,
+  type Batch,
+  type CellStyle,
+} from '@kofany/beamterm-terx';
+
+import type { ITheme } from './interfaces';
+import type { GhosttyCell } from './types';
+import { CellFlags } from './types';
+import type { IRenderer, IRenderable, FontMetrics, IScrollbackProvider } from './interfaces';
+import type { GraphicsManager } from './graphics';
+
+// ============================================================================
+// Beamterm Renderer Adapter
+// ============================================================================
+
+export interface BeamtermRendererOptions {
+  fontSize?: number;
+  fontFamily?: string;
+  lineHeight?: number;
+  cursorStyle?: 'block' | 'underline';
+  cursorBlink?: boolean;
+  theme?: ITheme;
+  /**
+   * Use external selection management (via SelectionManager).
+   * When true, native beamterm mouse selection is disabled and
+   * selection is controlled via setSelectionRange() API.
+   * Default: false (use beamterm's built-in selection)
+   */
+  useExternalSelection?: boolean;
+  /**
+   * Callback to get selected cell indices for JS-based selection rendering.
+   * Should return a Set of cell indices (y * cols + x) that are selected.
+   * Only used when useExternalSelection is true.
+   */
+  getSelectedCells?: () => Set<number> | null;
+}
+
+// Track initialization state
+let beamtermInitialized = false;
+
+/**
+ * Initialize beamterm WASM (call once at app startup)
+ */
+export async function initBeamtermWasm(): Promise<void> {
+  if (beamtermInitialized) return;
+  await initBeamterm();
+  beamtermInitialized = true;
+  console.log('[BeamtermRenderer] WASM initialized');
+}
+
+// Unique ID counter for canvas elements
+let canvasIdCounter = 0;
+
+/**
+ * Adapter between ghostty-web and @kofany/beamterm-terx (Subterm renderer)
+ */
+export class BeamtermRendererAdapter implements IRenderer {
+  private canvas: HTMLCanvasElement;
+  private renderer: BeamtermRenderer;
+  private _charWidth: number;
+  private _charHeight: number;
+  private fontSize: number;
+  private fontFamily: string;
+  private theme: Required<ITheme>;
+  private currentBuffer: IRenderable | null = null;
+
+  // Cursor state
+  private cursorStyle: 'block' | 'underline' = 'block';
+  private cursorBlink: boolean = false;
+  private cursorVisible: boolean = true;
+  private cursorBlinkInterval?: number;
+
+  // Link hover state
+  private hoveredHyperlinkId: number = 0;
+  private hoveredLinkRange: { startX: number; startY: number; endX: number; endY: number } | null = null;
+
+  // Selection mode: true = require Shift+Click, false = direct selection
+  private selectionRequireShift: boolean = true;
+
+  // Block selection mode: true = Block (Alt pressed), false = Linear (default)
+  private isBlockMode: boolean = false;
+
+  // External selection mode: when true, use SelectionManager instead of beamterm native
+  private useExternalSelection: boolean = false;
+
+  // Callback to get selected cells for JS-based selection rendering
+  private _getSelectedCells: (() => Set<number> | null) | null = null;
+
+  // Dirty tracking state for render optimization
+  private lastCursorX: number = -1;
+  private lastCursorY: number = -1;
+  private lastCursorVisible: boolean = false;
+  private lastCursorBlinkVisible: boolean = true;
+  private skippedFrames: number = 0;
+
+  // Mouse/selection state for rendering (don't skip frames during mouse drag or selection)
+  private isMouseDown: boolean = false;
+  private _isSelecting: boolean = false;
+
+  // Viewport tracking for scroll dirty detection
+  private lastViewportY: number = 0;
+
+  // PERFORMANCE: Reusable CellStyle objects to avoid allocations per frame
+  // We cache the last style to reuse when fg/bg/styleBits match
+  private cachedStyle: CellStyle | null = null;
+  private cachedStyleFg: number = -1;
+  private cachedStyleBg: number = -1;
+  private cachedStyleBits: number = -1;
+
+  // Default theme (Catppuccin Mocha inspired)
+  private static readonly DEFAULT_THEME: Required<ITheme> = {
+    foreground: '#cdd6f4',
+    background: '#1e1e2e',
+    cursor: '#f5e0dc',
+    cursorAccent: '#1e1e2e',
+    selectionBackground: '#89b4fa',
+    selectionForeground: '#1e1e2e',
+    black: '#45475a',
+    red: '#f38ba8',
+    green: '#a6e3a1',
+    yellow: '#f9e2af',
+    blue: '#89b4fa',
+    magenta: '#cba6f7',
+    cyan: '#94e2d5',
+    white: '#bac2de',
+    brightBlack: '#585b70',
+    brightRed: '#f38ba8',
+    brightGreen: '#a6e3a1',
+    brightYellow: '#f9e2af',
+    brightBlue: '#89b4fa',
+    brightMagenta: '#cba6f7',
+    brightCyan: '#94e2d5',
+    brightWhite: '#cdd6f4',
+  };
+
+  constructor(canvas: HTMLCanvasElement, options: BeamtermRendererOptions = {}) {
+    this.canvas = canvas;
+    this.fontSize = options.fontSize ?? 15;
+    this.theme = { ...BeamtermRendererAdapter.DEFAULT_THEME, ...options.theme };
+    this.cursorStyle = options.cursorStyle ?? 'block';
+    this.cursorBlink = options.cursorBlink ?? false;
+    this.useExternalSelection = options.useExternalSelection ?? false;
+    this._getSelectedCells = options.getSelectedCells ?? null;
+
+    // Ensure canvas has an ID for beamterm selector
+    if (!canvas.id) {
+      canvas.id = `beamterm-canvas-${++canvasIdCounter}`;
+    }
+    const canvasSelector = `#${canvas.id}`;
+
+    // Font family fallback chain
+    // Parse CSS font-family string into individual font names
+    this.fontFamily = options.fontFamily ?? 'JetBrains Mono';
+
+    // Split by comma if it's a CSS font-family string, or use as-is if single font
+    const parsedFonts = this.fontFamily
+      .split(',')
+      .map(f => f.replace(/['"]/g, '').trim())
+      .filter(f => f.length > 0 && f !== 'monospace'); // Remove empty and generic monospace
+
+    // Build fallback chain with beamterm-compatible fonts
+    const fontFamilies = [
+      ...parsedFonts,
+      'JetBrains Mono',
+      'Fira Code',
+      'monospace'
+    ];
+
+    // Deduplicate while preserving order
+    const cleanFamilies = [...new Set(fontFamilies)];
+
+    console.log('[BeamtermRenderer] Creating with:', {
+      fontSize: this.fontSize,
+      fontFamilies: cleanFamilies,
+      canvasSelector,
+    });
+
+    // Create beamterm renderer with dynamic atlas (for NerdFonts, emoji support)
+    // auto_resize_canvas_css=false - we handle canvas CSS sizing ourselves
+    this.renderer = BeamtermRenderer.withDynamicAtlas(
+      canvasSelector,
+      cleanFamilies,
+      this.fontSize,
+      false  // auto_resize_canvas_css - we control canvas sizing
+    );
+
+    // Get cell size from beamterm
+    const cellSize = this.renderer.cellSize();
+    this._charWidth = cellSize.width;
+    this._charHeight = cellSize.height;
+
+    console.log('[BeamtermRenderer] Cell size:', this._charWidth, 'x', this._charHeight);
+
+    // Verify renderer is working with a test render
+    const testBatch = this.renderer.batch();
+    testBatch.clear(this.hexToColor(this.theme.background));
+    testBatch.text(0, 0, "Test 🚀", style().fg(0xffffff).bg(0x1e1e2e));
+    testBatch.flush();
+    this.renderer.render();
+    console.log('[BeamtermRenderer] Test render completed');
+
+    // Enable beamterm native selection (Block mode, auto-copy to clipboard)
+    // Default: require Shift+Click to select (avoids conflicts with terminal apps like MC)
+    // Skip if using external selection (SelectionManager handles mouse events)
+    if (!this.useExternalSelection) {
+      this.enableSelectionMode();
+      console.log('[BeamtermRenderer] Native selection enabled (Block mode, Shift+Click, auto-copy)');
+    } else {
+      console.log('[BeamtermRenderer] External selection mode - native selection disabled');
+    }
+
+    // Start cursor blinking if enabled
+    if (this.cursorBlink) {
+      this.startCursorBlink();
+    }
+
+    // Track mouse state for smooth selection rendering
+    // During mouse drag, we don't skip frames to ensure selection updates smoothly
+    this.canvas.addEventListener('mousedown', () => {
+      this.isMouseDown = true;
+    });
+    this.canvas.addEventListener('mouseup', () => {
+      this.isMouseDown = false;
+    });
+    this.canvas.addEventListener('mouseleave', () => {
+      this.isMouseDown = false;
+    });
+  }
+
+  // ============================================================================
+  // IRenderer Interface Implementation
+  // ============================================================================
+
+  getCanvas(): HTMLCanvasElement {
+    return this.canvas;
+  }
+
+  getMetrics(): FontMetrics {
+    // _charWidth/_charHeight are PHYSICAL pixels from cellSize()
+    // Return CSS pixels for FitAddon calculations
+    const dpr = window.devicePixelRatio || 1;
+    return {
+      width: this._charWidth / dpr,
+      height: this._charHeight / dpr,
+      baseline: (this._charHeight / dpr) * 0.8,
+    };
+  }
+
+  get charWidth(): number {
+    // Return CSS pixels for external use
+    const dpr = window.devicePixelRatio || 1;
+    return this._charWidth / dpr;
+  }
+
+  get charHeight(): number {
+    // Return CSS pixels for external use
+    const dpr = window.devicePixelRatio || 1;
+    return this._charHeight / dpr;
+  }
+
+  // ============================================================================
+  // Rendering
+  // ============================================================================
+
+  /**
+   * Render terminal buffer using beamterm
+   */
+  render(
+    buffer: IRenderable,
+    forceAll: boolean = false,
+    viewportY: number = 0,
+    scrollbackProvider?: IScrollbackProvider,
+    _scrollbarOpacity: number = 1,
+    _graphicsManager?: GraphicsManager
+  ): void {
+    this.currentBuffer = buffer;
+    const cursor = buffer.getCursor();
+
+    // ========================================================================
+    // DIRTY CHECKING OPTIMIZATION
+    // Skip rendering if nothing has changed to save CPU
+    // ========================================================================
+    const cursorMoved = cursor.x !== this.lastCursorX || cursor.y !== this.lastCursorY;
+    const cursorVisibilityChanged = cursor.visible !== this.lastCursorVisible;
+    const cursorBlinkChanged = this.cursorVisible !== this.lastCursorBlinkVisible;
+    const viewportScrolled = viewportY !== this.lastViewportY;
+
+    // Check buffer dirty state using ghostty-wasm native tracking
+    // Use type assertion since isDirty() is not in IRenderable interface
+    const bufferWithDirty = buffer as IRenderable & { isDirty?: () => boolean; needsFullRedraw?: () => boolean };
+    const bufferIsDirty = bufferWithDirty.isDirty?.() ?? true; // Default to dirty if method not available
+    const needsFullRedraw = forceAll || (bufferWithDirty.needsFullRedraw?.() ?? false);
+
+    // Skip render if nothing changed
+    // Note: Don't skip during mouse drag (isMouseDown) or external selection (isSelecting)
+    // Note: Don't skip when viewport scrolled (viewportY changed) to update scrollback view
+    const isSelectionActive = this.isMouseDown || this._isSelecting;
+    if (!needsFullRedraw && !bufferIsDirty && !cursorMoved && !cursorVisibilityChanged && !cursorBlinkChanged && !viewportScrolled && !isSelectionActive) {
+      this.skippedFrames++;
+      this.renderStats.skippedFrames++;
+      this.renderStats._skippedThisSecond++;
+
+      // Update skipped per second counter
+      const now = Date.now();
+      if (now - this.renderStats._lastSecond >= 1000) {
+        this.renderStats.skippedPerSecond = this.renderStats._skippedThisSecond;
+        this.renderStats.rendersPerSecond = this.renderStats._rendersThisSecond;
+        this.renderStats._skippedThisSecond = 0;
+        this.renderStats._rendersThisSecond = 0;
+        this.renderStats._lastSecond = now;
+      }
+
+      // Still need to clear dirty to prevent ghostty-wasm from accumulating dirty state
+      buffer.clearDirty();
+      return;
+    }
+
+    // Update cursor tracking state
+    this.lastCursorX = cursor.x;
+    this.lastCursorY = cursor.y;
+    this.lastCursorVisible = cursor.visible;
+    this.lastCursorBlinkVisible = this.cursorVisible;
+    this.lastViewportY = viewportY;
+
+    const renderStart = performance.now();
+    try {
+      const dims = buffer.getDimensions();
+      const scrollbackLength = scrollbackProvider?.getScrollbackLength() ?? 0;
+
+      // Create batch for efficient updates
+      const batch = this.renderer.batch();
+
+      // Clear with background color
+      batch.clear(this.hexToColor(this.theme.background));
+
+      // Render all lines (with scrollback support)
+      const floorViewportY = Math.floor(viewportY);
+
+      // PERFORMANCE: Use getViewport() to get all cells in ONE call (zero allocation)
+      const bufferWithViewport = buffer as IRenderable & { getViewport?: () => GhosttyCell[] };
+      const viewport = bufferWithViewport.getViewport?.();
+      const useViewport = viewport && floorViewportY === 0;
+
+      // Get selected cells for JS-based selection rendering (only when using external selection)
+      const selectedCells = this.useExternalSelection && this._getSelectedCells
+        ? this._getSelectedCells()
+        : null;
+
+      // PERFORMANCE: Use batch.text() for runs of same-styled text
+      // This avoids serde serialization overhead of batch.cells()
+      // Reusable run state object (single allocation per frame)
+      const run = { text: '', startX: 0, y: 0, fg: -1, bg: -1, styleBits: 0 };
+      let textRunCount = 0;
+
+      // Helper to flush current run using batch.text()
+      const flushRun = () => {
+        if (run.text.length > 0) {
+          const runStyle = this.getOrCreateStyle(run.fg, run.bg, run.styleBits);
+          batch.text(run.startX, run.y, run.text, runStyle);
+          textRunCount++;
+        }
+        run.text = '';
+      };
+
+      for (let y = 0; y < dims.rows; y++) {
+        // Always flush at row boundary
+        flushRun();
+
+        if (useViewport) {
+          // FAST PATH: Use viewport array directly
+          const rowStart = y * dims.cols;
+          for (let x = 0; x < dims.cols; x++) {
+            const ghosttyCell = viewport[rowStart + x];
+            if (!ghosttyCell || ghosttyCell.width === 0) continue;
+            this.processCell(ghosttyCell, x, y, buffer, run, flushRun, selectedCells, dims.cols);
+          }
+        } else {
+          // SLOW PATH: When scrolled up, need per-line access
+          let line: GhosttyCell[] | null = null;
+
+          if (floorViewportY > 0 && scrollbackProvider) {
+            if (y < floorViewportY) {
+              const scrollbackOffset = scrollbackLength - floorViewportY + y;
+              line = scrollbackProvider.getScrollbackLine(scrollbackOffset);
+            } else {
+              const screenRow = y - floorViewportY;
+              line = buffer.getLine(screenRow);
+            }
+          } else {
+            line = buffer.getLine(y);
+          }
+
+          if (!line) continue;
+
+          for (let x = 0; x < line.length; x++) {
+            const ghosttyCell = line[x];
+            if (!ghosttyCell || ghosttyCell.width === 0) continue;
+            this.processCell(ghosttyCell, x, y, buffer, run, flushRun, selectedCells, dims.cols);
+          }
+        }
+      }
+
+      // Final flush for last run
+      flushRun();
+
+      // Track text runs for performance monitoring
+      this.renderStats.textRunsPerFrame = textRunCount;
+
+      // Render cursor (only if visible and blinking state allows)
+      if (cursor.visible && this.cursorVisible) {
+        this.renderCursor(batch, cursor.x, cursor.y, buffer);
+      }
+
+      // Render (flush is automatic since beamterm 0.4.0)
+      this.renderer.render();
+
+      // Clear dirty flags
+      buffer.clearDirty();
+
+      // Track render performance
+      const renderEnd = performance.now();
+      const renderTime = renderEnd - renderStart;
+      this.renderStats.lastRenderTime = renderTime;
+      this.renderStats.renderCount++;
+      this.renderStats._rendersThisSecond++;
+
+      // Ring buffer for O(1) average calculation (no allocation, no shift)
+      const idx = this.renderStats._renderTimesIndex;
+      const oldValue = this.renderStats._renderTimes[idx];
+      this.renderStats._renderTimes[idx] = renderTime;
+      this.renderStats._renderTimesIndex = (idx + 1) % 60;
+
+      // Update running sum
+      if (this.renderStats._renderTimesCount < 60) {
+        this.renderStats._renderTimesSum += renderTime;
+        this.renderStats._renderTimesCount++;
+      } else {
+        this.renderStats._renderTimesSum += renderTime - oldValue;
+      }
+      this.renderStats.avgRenderTime = this.renderStats._renderTimesSum / this.renderStats._renderTimesCount;
+
+      // Calculate renders per second and skipped per second
+      const currentTime = Date.now();
+      if (currentTime - this.renderStats._lastSecond >= 1000) {
+        this.renderStats.rendersPerSecond = this.renderStats._rendersThisSecond;
+        this.renderStats.skippedPerSecond = this.renderStats._skippedThisSecond;
+        this.renderStats._rendersThisSecond = 0;
+        this.renderStats._skippedThisSecond = 0;
+        this.renderStats._lastSecond = currentTime;
+      }
+    } catch (err) {
+      console.error('[BeamtermRenderer] Render error:', err);
+    }
+  }
+
+  // Performance tracking (public for debug access)
+  // Uses ring buffer instead of push/shift to avoid O(n) operations
+  public renderStats = {
+    lastRenderTime: 0,
+    avgRenderTime: 0,
+    renderCount: 0,
+    rendersPerSecond: 0,
+    skippedFrames: 0,      // Frames skipped due to dirty checking
+    skippedPerSecond: 0,   // Skip rate for monitoring
+    textRunsPerFrame: 0,   // NEW: Number of batch.text() calls per frame
+    _renderTimes: new Float32Array(60), // Ring buffer (fixed size, no allocation)
+    _renderTimesIndex: 0,
+    _renderTimesCount: 0,
+    _renderTimesSum: 0,    // Running sum for O(1) average
+    _lastSecond: Date.now(),
+    _rendersThisSecond: 0,
+    _skippedThisSecond: 0,
+  };
+
+  /**
+   * Build text string from a line of cells
+   */
+  private buildLineText(
+    line: GhosttyCell[],
+    buffer: IRenderable,
+    y: number
+  ): { text: string; nonEmpty: number } {
+    let text = '';
+    let nonEmpty = 0;
+
+    for (let x = 0; x < line.length; x++) {
+      const ghosttyCell = line[x];
+      if (!ghosttyCell) {
+        text += ' ';
+        continue;
+      }
+
+      // Skip spacer cells (width 0) - they're part of wide characters
+      if (ghosttyCell.width === 0) {
+        continue;
+      }
+
+      // Get character from codepoint
+      let char = ghosttyCell.codepoint > 0 ? String.fromCodePoint(ghosttyCell.codepoint) : ' ';
+
+      // Handle grapheme clusters (emoji, combining characters)
+      if (ghosttyCell.grapheme_len > 0 && buffer.getGraphemeString) {
+        const grapheme = buffer.getGraphemeString(y, x);
+        if (grapheme) {
+          char = grapheme;
+        }
+      }
+
+      text += char;
+      if (ghosttyCell.codepoint > 32) nonEmpty++;
+    }
+
+    return { text, nonEmpty };
+  }
+
+  /**
+   * Check if a cell is within the selection
+   */
+  private isCellSelected(
+    x: number,
+    y: number,
+    start?: { x: number; y: number },
+    end?: { x: number; y: number }
+  ): boolean {
+    if (!start || !end) return false;
+
+    // Normalize selection (start should be before end)
+    let startY = start.y;
+    let endY = end.y;
+    let startX = start.x;
+    let endX = end.x;
+
+    if (startY > endY || (startY === endY && startX > endX)) {
+      [startY, endY] = [endY, startY];
+      [startX, endX] = [endX, startX];
+    }
+
+    // Check if cell is in selection range
+    if (y < startY || y > endY) return false;
+    if (y === startY && y === endY) return x >= startX && x <= endX;
+    if (y === startY) return x >= startX;
+    if (y === endY) return x <= endX;
+    return true;
+  }
+
+  /**
+   * PERFORMANCE: Get or create a cached CellStyle to avoid allocations
+   */
+  private getOrCreateStyle(fg: number, bg: number, styleBits: number = 0): CellStyle {
+    // Reuse cached style if colors and style bits match
+    if (this.cachedStyle !== null &&
+        this.cachedStyleFg === fg &&
+        this.cachedStyleBg === bg &&
+        this.cachedStyleBits === styleBits) {
+      return this.cachedStyle;
+    }
+
+    // Create new style with colors
+    let cellStyle = style().fg(fg).bg(bg);
+
+    // Apply text styles based on flags
+    if (styleBits & CellFlags.BOLD) {
+      cellStyle = cellStyle.bold();
+    }
+    if (styleBits & CellFlags.ITALIC) {
+      cellStyle = cellStyle.italic();
+    }
+    if (styleBits & CellFlags.UNDERLINE) {
+      cellStyle = cellStyle.underline();
+    }
+    if (styleBits & CellFlags.STRIKETHROUGH) {
+      cellStyle = cellStyle.strikethrough();
+    }
+
+    // Cache it
+    this.cachedStyle = cellStyle;
+    this.cachedStyleFg = fg;
+    this.cachedStyleBg = bg;
+    this.cachedStyleBits = styleBits;
+    return this.cachedStyle;
+  }
+
+  /**
+   * Process a cell and add to current text run or flush and start new run
+   * PERFORMANCE: Uses batch.text() which avoids serde serialization
+   *
+   * @param selectedCells - Set of cell indices (y * cols + x) that are selected
+   * @param cols - Number of columns (for index calculation)
+   */
+  private processCell(
+    ghosttyCell: GhosttyCell,
+    x: number,
+    y: number,
+    buffer: IRenderable,
+    run: { text: string; startX: number; y: number; fg: number; bg: number; styleBits: number },
+    flushRun: () => void,
+    selectedCells: Set<number> | null,
+    cols: number
+  ): void {
+    // Get character from codepoint
+    const char = ghosttyCell.codepoint > 0 ? String.fromCodePoint(ghosttyCell.codepoint) : ' ';
+
+    // Handle grapheme clusters (emoji, combining characters)
+    let symbol = char;
+    if (ghosttyCell.grapheme_len > 0 && buffer.getGraphemeString) {
+      const grapheme = buffer.getGraphemeString(y, x);
+      if (grapheme) {
+        symbol = grapheme;
+      }
+    }
+
+    // Convert colors
+    let fg = this.rgbToColor(ghosttyCell.fg_r, ghosttyCell.fg_g, ghosttyCell.fg_b);
+    let bg = this.rgbToColor(ghosttyCell.bg_r, ghosttyCell.bg_g, ghosttyCell.bg_b);
+
+    // Handle inverse
+    if (ghosttyCell.flags & CellFlags.INVERSE) {
+      [fg, bg] = [bg, fg];
+    }
+
+    // JS-based selection rendering: swap fg/bg for selected cells
+    if (selectedCells !== null && selectedCells.has(y * cols + x)) {
+      // Use theme selection colors (reverse video style)
+      fg = this.hexToColor(this.theme.selectionForeground);
+      bg = this.hexToColor(this.theme.selectionBackground);
+    }
+
+    // Extract style bits (bold, italic, underline, strikethrough)
+    // Mask out INVERSE since we handle it separately above
+    const styleBits = ghosttyCell.flags & (CellFlags.BOLD | CellFlags.ITALIC | CellFlags.UNDERLINE | CellFlags.STRIKETHROUGH);
+
+    // Check if this cell continues the current run (same colors, same style, same row, consecutive x)
+    const canContinueRun = run.text.length > 0 &&
+                          run.y === y &&
+                          run.fg === fg &&
+                          run.bg === bg &&
+                          run.styleBits === styleBits &&
+                          (run.startX + run.text.length === x);
+
+    if (canContinueRun) {
+      // Extend current run
+      run.text += symbol;
+    } else {
+      // Flush previous run and start new one
+      flushRun();
+      run.text = symbol;
+      run.startX = x;
+      run.y = y;
+      run.fg = fg;
+      run.bg = bg;
+      run.styleBits = styleBits;
+    }
+  }
+
+  /**
+   * Render cursor with the character underneath visible
+   */
+  private renderCursor(batch: Batch, x: number, y: number, buffer: IRenderable): void {
+    const cursorColor = this.hexToColor(this.theme.cursor);
+    const cursorAccent = this.hexToColor(this.theme.cursorAccent);
+
+    // Get the cell at cursor position to show the character underneath
+    const line = buffer.getLine(y);
+    let charUnderCursor = ' ';
+    let charFg = this.hexToColor(this.theme.foreground);
+    let charBg = this.hexToColor(this.theme.background);
+
+    if (line && x < line.length) {
+      const ghosttyCell = line[x];
+      if (ghosttyCell && ghosttyCell.codepoint > 0) {
+        // Get character from codepoint or grapheme
+        if (ghosttyCell.grapheme_len > 0 && buffer.getGraphemeString) {
+          charUnderCursor = buffer.getGraphemeString(y, x) || String.fromCodePoint(ghosttyCell.codepoint);
+        } else {
+          charUnderCursor = String.fromCodePoint(ghosttyCell.codepoint);
+        }
+        charFg = this.rgbToColor(ghosttyCell.fg_r, ghosttyCell.fg_g, ghosttyCell.fg_b);
+        charBg = this.rgbToColor(ghosttyCell.bg_r, ghosttyCell.bg_g, ghosttyCell.bg_b);
+      }
+    }
+
+    let cursorCellStyle: CellStyle;
+
+    switch (this.cursorStyle) {
+      case 'block':
+        // Block cursor: show character with inverted colors (reverse video)
+        // Use cursor color as background, cursor accent (or char fg) as foreground
+        cursorCellStyle = style().fg(cursorAccent).bg(cursorColor);
+        batch.cell(x, y, cell(charUnderCursor, cursorCellStyle));
+        break;
+
+      case 'underline':
+        // Underline cursor: show character normally with underline added
+        cursorCellStyle = style().fg(charFg).bg(charBg).underline();
+        batch.cell(x, y, cell(charUnderCursor, cursorCellStyle));
+        break;
+    }
+  }
+
+  // ============================================================================
+  // Cursor Blinking
+  // ============================================================================
+
+  private startCursorBlink(): void {
+    if (this.cursorBlinkInterval) return;
+
+    this.cursorBlinkInterval = window.setInterval(() => {
+      this.cursorVisible = !this.cursorVisible;
+      // Render will be called by the render loop
+    }, 530);
+  }
+
+  private stopCursorBlink(): void {
+    if (this.cursorBlinkInterval) {
+      window.clearInterval(this.cursorBlinkInterval);
+      this.cursorBlinkInterval = undefined;
+    }
+    this.cursorVisible = true;
+  }
+
+  // ============================================================================
+  // Configuration Methods
+  // ============================================================================
+
+  setCursorStyle(cursorStyle: 'block' | 'underline'): void {
+    this.cursorStyle = cursorStyle;
+  }
+
+  setCursorBlink(enabled: boolean): void {
+    this.cursorBlink = enabled;
+    if (enabled) {
+      this.startCursorBlink();
+    } else {
+      this.stopCursorBlink();
+    }
+  }
+
+  setFontSize(size: number): void {
+    if (this.fontSize === size) return;
+    this.fontSize = size;
+    this.recreateRenderer();
+  }
+
+  setFontFamily(family: string): void {
+    if (this.fontFamily === family) return;
+    this.fontFamily = family;
+    this.recreateRenderer();
+  }
+
+  /**
+   * Replace font atlas with new settings.
+   * Uses beamterm's replaceWithDynamicAtlas() for efficient font changes
+   * without destroying the WebGL context.
+   */
+  private recreateRenderer(): void {
+    console.log('[BeamtermRenderer] Replacing font atlas with fontSize:', this.fontSize);
+
+    // Parse font family
+    const parsedFonts = this.fontFamily
+      .split(',')
+      .map(f => f.replace(/['"]/g, '').trim())
+      .filter(f => f.length > 0 && f !== 'monospace');
+
+    const fontFamilies = [...new Set([
+      ...parsedFonts,
+      'JetBrains Mono',
+      'Fira Code',
+      'monospace'
+    ])];
+
+    // Replace atlas in-place (no need to free/recreate renderer)
+    this.renderer.replaceWithDynamicAtlas(fontFamilies, this.fontSize);
+
+    // Update cell size
+    const cellSize = this.renderer.cellSize();
+    this._charWidth = cellSize.width;
+    this._charHeight = cellSize.height;
+
+    // Re-enable selection after atlas replacement (only if using native selection)
+    if (!this.useExternalSelection) {
+      this.enableSelectionMode();
+    }
+
+    console.log('[BeamtermRenderer] Font atlas replaced, cell size:', this._charWidth, 'x', this._charHeight);
+  }
+
+  setTheme(theme: ITheme): void {
+    this.theme = { ...BeamtermRendererAdapter.DEFAULT_THEME, ...theme };
+  }
+
+  setHoveredHyperlinkId(hyperlinkId: number): void {
+    this.hoveredHyperlinkId = hyperlinkId;
+  }
+
+  setHoveredLinkRange(range: { startX: number; startY: number; endX: number; endY: number } | null): void {
+    this.hoveredLinkRange = range;
+  }
+
+  // ============================================================================
+  // Selection Mode
+  // ============================================================================
+
+  /**
+   * Enable selection with current mode settings
+   * Uses isBlockMode to determine Linear vs Block selection
+   *
+   * Modifier logic:
+   * - Shift mode ON + Alt: require SHIFT+ALT, Block mode
+   * - Shift mode ON + no Alt: require SHIFT, Linear mode
+   * - Shift mode OFF + Alt: require ALT, Block mode
+   * - Shift mode OFF + no Alt: require NONE, Linear mode
+   */
+  private enableSelectionMode(): void {
+    const mode = this.isBlockMode ? SelectionMode.Block : SelectionMode.Linear;
+
+    // Build required modifiers based on current state
+    let modifiers: typeof ModifierKeys.NONE;
+    if (this.selectionRequireShift && this.isBlockMode) {
+      // Shift mode ON + Alt pressed = require both
+      modifiers = ModifierKeys.SHIFT.or(ModifierKeys.ALT);
+    } else if (this.selectionRequireShift) {
+      // Shift mode ON, no Alt = require only Shift
+      modifiers = ModifierKeys.SHIFT;
+    } else if (this.isBlockMode) {
+      // Shift mode OFF, Alt pressed = require only Alt
+      modifiers = ModifierKeys.ALT;
+    } else {
+      // Shift mode OFF, no Alt = no modifiers required
+      modifiers = ModifierKeys.NONE;
+    }
+
+    const modeStr = this.isBlockMode ? 'Block' : 'Linear';
+    console.log(`[BeamtermRenderer] enableSelectionMode(): mode=${modeStr}, modifiers=${this.selectionRequireShift ? 'Shift' : ''}${this.isBlockMode ? '+Alt' : ''}`);
+
+    // Clear any existing selection before changing mode
+    this.renderer.clearSelection();
+    this.renderer.enableSelectionWithOptions(mode, true, modifiers);
+  }
+
+  /**
+   * Set block selection mode (Alt key toggles this)
+   * @param enabled true = Block selection, false = Linear selection (default)
+   */
+  setBlockMode(enabled: boolean): void {
+    if (this.isBlockMode === enabled) return;
+    this.isBlockMode = enabled;
+    if (!this.useExternalSelection) {
+      this.enableSelectionMode();
+    }
+  }
+
+  /**
+   * Get current block selection mode
+   */
+  getBlockMode(): boolean {
+    return this.isBlockMode;
+  }
+
+  /**
+   * Set whether selection requires Shift+Click
+   * @param requireShift true = Shift+Click to select (default), false = direct selection
+   */
+  setSelectionRequireShift(requireShift: boolean): void {
+    if (this.selectionRequireShift === requireShift) return;
+    this.selectionRequireShift = requireShift;
+    if (!this.useExternalSelection) {
+      this.enableSelectionMode();
+    }
+    console.log(`[BeamtermRenderer] Selection mode: ${requireShift ? 'Shift+Click' : 'Direct'}`);
+  }
+
+  /**
+   * Get current selection mode
+   */
+  getSelectionRequireShift(): boolean {
+    return this.selectionRequireShift;
+  }
+
+  /**
+   * Check if external selection mode is enabled
+   */
+  isUsingExternalSelection(): boolean {
+    return this.useExternalSelection;
+  }
+
+  // ============================================================================
+  // Resize
+  // ============================================================================
+
+  /**
+   * Resize renderer - accepts cols and rows, converts to pixels
+   * Uses resizePhysical() for precise HiDPI control without rounding errors
+   */
+  resize(cols: number, rows: number): void {
+    const dpr = window.devicePixelRatio || 1;
+
+    // _charWidth/_charHeight are PHYSICAL pixels from cellSize()
+    const physicalWidth = Math.floor(cols * this._charWidth);
+    const physicalHeight = Math.floor(rows * this._charHeight);
+
+    // CSS pixels for layout (no rounding - exact division)
+    const cssWidth = physicalWidth / dpr;
+    const cssHeight = physicalHeight / dpr;
+
+    // Use resizePhysical for precise control - no internal rounding
+    this.renderer.resizePhysical(physicalWidth, physicalHeight, cssWidth, cssHeight);
+
+    // Update cell size (may change slightly after resize)
+    const cellSize = this.renderer.cellSize();
+    this._charWidth = cellSize.width;
+    this._charHeight = cellSize.height;
+
+    // Re-enable selection after resize (required by beamterm, only if using native selection)
+    if (!this.useExternalSelection) {
+      this.enableSelectionMode();
+    }
+  }
+
+  /**
+   * Get terminal size in cells
+   */
+  getTerminalSize(): { cols: number; rows: number } {
+    const size = this.renderer.terminalSize();
+    return { cols: size.width, rows: size.height };
+  }
+
+  // ============================================================================
+  // Selection and Clipboard
+  // ============================================================================
+
+  /**
+   * Check if there is an active selection
+   */
+  hasSelection(): boolean {
+    return this.renderer.hasSelection();
+  }
+
+  /**
+   * Clear the current selection
+   */
+  clearSelection(): void {
+    this.renderer.clearSelection();
+  }
+
+  /**
+   * Copy current selection to clipboard
+   * @returns true if something was copied, false if no selection
+   */
+  copySelection(): boolean {
+    if (!this.renderer.hasSelection()) {
+      return false;
+    }
+
+    // Beamterm's enableSelection with trimWhitespace=true already handles
+    // auto-copy to clipboard on mouse selection. For explicit Cmd+C,
+    // we need to get the selected text and copy it.
+    // Note: The beamterm renderer doesn't expose a direct "getSelectedText"
+    // but enableSelection(mode, true) auto-copies on selection.
+    // If we need manual copy, we would need to track selection ourselves.
+
+    // Since beamterm auto-copies on selection release, Cmd+C just confirms selection exists
+    console.log('[BeamtermRenderer] Selection exists, was auto-copied on selection');
+    return true;
+  }
+
+  /**
+   * Copy text to clipboard
+   */
+  copyToClipboard(text: string): void {
+    this.renderer.copyToClipboard(text);
+  }
+
+  /**
+   * Set external selection state (for SelectionManager integration).
+   * When true, renderer won't skip frames to ensure smooth selection updates.
+   */
+  setIsSelecting(value: boolean): void {
+    this._isSelecting = value;
+  }
+
+  // ============================================================================
+  // Cleanup
+  // ============================================================================
+
+  clear(): void {
+    const batch = this.renderer.batch();
+    batch.clear(this.hexToColor(this.theme.background));
+    batch.flush();
+    this.renderer.render();
+  }
+
+  dispose(): void {
+    this.stopCursorBlink();
+
+    // Free beamterm WASM renderer (releases WebGL context)
+    if (this.renderer) {
+      try {
+        this.renderer.free();
+      } catch (e) {
+        console.warn('[BeamtermRenderer] Dispose error:', e);
+      }
+    }
+  }
+
+  // ============================================================================
+  // Color Utilities
+  // ============================================================================
+
+  /**
+   * Convert RGB components to 0xRRGGBB
+   */
+  private rgbToColor(r: number, g: number, b: number): number {
+    return ((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff);
+  }
+
+  /**
+   * Convert hex string to 0xRRGGBB
+   */
+  private hexToColor(hex: string): number {
+    const clean = hex.replace('#', '');
+    return parseInt(clean, 16);
+  }
+}

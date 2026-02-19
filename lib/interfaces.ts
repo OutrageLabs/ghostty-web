@@ -3,24 +3,109 @@
  */
 
 import type { Ghostty } from './ghostty';
+import type { GraphicsOptions } from './graphics';
+import type { GhosttyCell } from './types';
+
+// ============================================================================
+// Renderer Interfaces
+// ============================================================================
+
+/**
+ * Interface for objects that can be rendered
+ */
+export interface IRenderable {
+  getLine(y: number): GhosttyCell[] | null;
+  getCursor(): { x: number; y: number; visible: boolean };
+  getDimensions(): { cols: number; rows: number };
+  isRowDirty(y: number): boolean;
+  /** Returns true if a full redraw is needed (e.g., screen change) */
+  needsFullRedraw?(): boolean;
+  clearDirty(): void;
+  /**
+   * Get the full grapheme string for a cell at (row, col).
+   * For cells with grapheme_len > 0, this returns all codepoints combined.
+   * For simple cells, returns the single character.
+   */
+  getGraphemeString?(row: number, col: number): string;
+  /**
+   * Get ALL viewport cells in ONE call - avoids per-line allocations.
+   * Returns a flat array of cells (cols * rows).
+   * PERFORMANCE: Use this instead of getLine() in render loops!
+   */
+  getViewport?(): GhosttyCell[];
+}
+
+/**
+ * Provider for scrollback buffer lines
+ */
+export interface IScrollbackProvider {
+  getScrollbackLine(offset: number): GhosttyCell[] | null;
+  getScrollbackLength(): number;
+}
+
+/**
+ * Renderer configuration options
+ */
+export interface RendererOptions {
+  fontSize?: number; // Default: 15
+  fontFamily?: string; // Default: 'monospace'
+  lineHeight?: number; // Line height multiplier, default: 1.0 (use 1.2 for Nerd Fonts)
+  cursorStyle?: 'block' | 'underline'; // Default: 'block'
+  cursorBlink?: boolean; // Default: false
+  theme?: ITheme;
+  devicePixelRatio?: number; // Default: window.devicePixelRatio
+}
+
+/**
+ * Font metrics for cell sizing
+ */
+export interface FontMetrics {
+  width: number; // Character cell width in CSS pixels
+  height: number; // Character cell height in CSS pixels
+  baseline: number; // Distance from top to text baseline
+}
+
+/**
+ * Common interface for terminal renderers
+ */
+export interface IRenderer {
+  getCanvas(): HTMLCanvasElement;
+  getMetrics(): FontMetrics;
+  readonly charWidth: number;
+  readonly charHeight: number;
+}
+
+// ============================================================================
+// Terminal Interfaces
+// ============================================================================
 
 export interface ITerminalOptions {
   cols?: number; // Default: 80
   rows?: number; // Default: 24
   cursorBlink?: boolean; // Default: false
-  cursorStyle?: 'block' | 'underline' | 'bar';
+  cursorStyle?: 'block' | 'underline';
   theme?: ITheme;
   scrollback?: number; // Default: 1000
   fontSize?: number; // Default: 15
   fontFamily?: string; // Default: 'monospace'
+  lineHeight?: number; // Line height multiplier (default: 1.0, use 1.2 for Nerd Fonts)
   allowTransparency?: boolean;
-
+  
   // Phase 1 additions
   convertEol?: boolean; // Convert \n to \r\n (default: false)
   disableStdin?: boolean; // Disable keyboard input (default: false)
 
   // Scrolling options
   smoothScrollDuration?: number; // Duration in ms for smooth scroll animation (default: 100, 0 = instant)
+
+  // Graphics options (Kitty Graphics Protocol)
+  graphics?: GraphicsOptions;
+
+  // Dead key handling (Windows keyboard layouts)
+  // When true, dead keys (like ~ on US International) are sent immediately
+  // instead of waiting for composition. Useful for terminal apps.
+  // Default: true (recommended for terminals)
+  disableDeadKeys?: boolean;
 
   // Internal: Ghostty WASM instance (optional, for test isolation)
   // If not provided, uses the module-level instance from init()

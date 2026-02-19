@@ -1,8 +1,8 @@
 diff --git a/.gitignore b/.gitignore
-index e451b171a..89c623d8b 100644
+index e521f8851..5caea8e86 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -23,3 +23,4 @@ glad.zip
+@@ -24,3 +24,4 @@ glad.zip
  /ghostty.qcow2
  
  vgcore.*
@@ -283,10 +283,10 @@ index 000000000..298ad36c1
 +
 +#endif /* GHOSTTY_VT_TERMINAL_H */
 diff --git a/src/lib_vt.zig b/src/lib_vt.zig
-index 03a883e20..f07bbd759 100644
+index 03a883e20..b92a9a24d 100644
 --- a/src/lib_vt.zig
 +++ b/src/lib_vt.zig
-@@ -140,6 +140,41 @@ comptime {
+@@ -140,6 +140,47 @@ comptime {
          @export(&c.sgr_unknown_partial, .{ .name = "ghostty_sgr_unknown_partial" });
          @export(&c.sgr_attribute_tag, .{ .name = "ghostty_sgr_attribute_tag" });
          @export(&c.sgr_attribute_value, .{ .name = "ghostty_sgr_attribute_value" });
@@ -325,11 +325,46 @@ index 03a883e20..f07bbd759 100644
 +        // Response API (for DSR and other queries)
 +        @export(&c.terminal_has_response, .{ .name = "ghostty_terminal_has_response" });
 +        @export(&c.terminal_read_response, .{ .name = "ghostty_terminal_read_response" });
++
++        // Palette / Colors API
++        @export(&c.terminal_set_palette_color, .{ .name = "ghostty_terminal_set_palette_color" });
++        @export(&c.terminal_set_background_color, .{ .name = "ghostty_terminal_set_background_color" });
++        @export(&c.terminal_set_foreground_color, .{ .name = "ghostty_terminal_set_foreground_color" });
++        @export(&c.terminal_set_cursor_color, .{ .name = "ghostty_terminal_set_cursor_color" });
  
          // On Wasm we need to export our allocator convenience functions.
          if (builtin.target.cpu.arch.isWasm()) {
+diff --git a/src/terminal/PageList.zig b/src/terminal/PageList.zig
+index 71534d0aa..bec84d86f 100644
+--- a/src/terminal/PageList.zig
++++ b/src/terminal/PageList.zig
+@@ -479,8 +479,10 @@ fn initPages(
+ 
+         // In runtime safety modes we have to memset because the Zig allocator
+         // interface will always memset to 0xAA for undefined. In non-safe modes
+-        // we use a page allocator and the OS guarantees zeroed memory.
+-        if (comptime std.debug.runtime_safety) @memset(page_buf, 0);
++        // we use a page allocator and the OS guarantees zeroed memory. However,
++        // WASM allocators do NOT guarantee zeroed memory, so always zero for WASM.
++        if (comptime std.debug.runtime_safety or builtin.target.cpu.arch.isWasm())
++            @memset(page_buf, 0);
+ 
+         // Initialize the first set of pages to contain our viewport so that
+         // the top of the first page is always the active area.
+@@ -3366,8 +3368,9 @@ inline fn createPageExt(
+         page_alloc.free(page_buf);
+ 
+     // Required only with runtime safety because allocators initialize
+-    // to undefined, 0xAA.
+-    if (comptime std.debug.runtime_safety) @memset(page_buf, 0);
++    // to undefined, 0xAA. Also required for WASM which doesn't guarantee zeroed memory.
++    if (comptime std.debug.runtime_safety or builtin.target.cpu.arch.isWasm())
++        @memset(page_buf, 0);
+ 
+     page.* = .{
+         .data = .initBuf(.init(page_buf), layout),
 diff --git a/src/terminal/c/main.zig b/src/terminal/c/main.zig
-index bc92597f5..18503933f 100644
+index bc92597f5..fcd53e0d4 100644
 --- a/src/terminal/c/main.zig
 +++ b/src/terminal/c/main.zig
 @@ -4,6 +4,7 @@ pub const key_event = @import("key_event.zig");
@@ -340,7 +375,7 @@ index bc92597f5..18503933f 100644
  
  // The full C API, unexported.
  pub const osc_new = osc.new;
-@@ -52,6 +53,42 @@ pub const key_encoder_encode = key_encode.encode;
+@@ -52,6 +53,48 @@ pub const key_encoder_encode = key_encode.encode;
  
  pub const paste_is_safe = paste.is_safe;
  
@@ -380,10 +415,16 @@ index bc92597f5..18503933f 100644
 +pub const terminal_has_response = terminal.hasResponse;
 +pub const terminal_read_response = terminal.readResponse;
 +
++// Palette / Colors API
++pub const terminal_set_palette_color = terminal.setPaletteColor;
++pub const terminal_set_background_color = terminal.setBackgroundColor;
++pub const terminal_set_foreground_color = terminal.setForegroundColor;
++pub const terminal_set_cursor_color = terminal.setCursorColor;
++
  test {
      _ = color;
      _ = osc;
-@@ -59,6 +96,7 @@ test {
+@@ -59,6 +102,7 @@ test {
      _ = key_encode;
      _ = paste;
      _ = sgr;
@@ -393,10 +434,10 @@ index bc92597f5..18503933f 100644
      _ = @import("../../lib/allocator.zig");
 diff --git a/src/terminal/c/terminal.zig b/src/terminal/c/terminal.zig
 new file mode 100644
-index 000000000..d57b4e405
+index 000000000..fce389895
 --- /dev/null
 +++ b/src/terminal/c/terminal.zig
-@@ -0,0 +1,1025 @@
+@@ -0,0 +1,1080 @@
 +//! C API wrapper for Terminal
 +//!
 +//! This provides a minimal, high-performance interface to Ghostty's Terminal
@@ -454,7 +495,7 @@ index 000000000..d57b4e405
 +        comptime action: Action.Tag,
 +        value: Action.Value(action),
 +    ) !void {
-+        switch (action) {
++        return switch (action) {
 +            // Device status reports - these need responses
 +            .device_status => try self.handleDeviceStatus(value.request),
 +            .device_attributes => try self.handleDeviceAttributes(value),
@@ -515,8 +556,8 @@ index 000000000..d57b4e405
 +            .delete_lines => self.terminal.deleteLines(value),
 +            .scroll_up => self.terminal.scrollUp(value),
 +            .scroll_down => self.terminal.scrollDown(value),
-+            .horizontal_tab => try self.horizontalTab(value),
-+            .horizontal_tab_back => try self.horizontalTabBack(value),
++            .horizontal_tab => self.horizontalTab(value),
++            .horizontal_tab_back => self.horizontalTabBack(value),
 +            .tab_clear_current => self.terminal.tabClear(.current),
 +            .tab_clear_all => self.terminal.tabClear(.all),
 +            .tab_set => self.terminal.tabSet(),
@@ -538,7 +579,7 @@ index 000000000..d57b4e405
 +                }
 +            },
 +            .save_cursor => self.terminal.saveCursor(),
-+            .restore_cursor => try self.terminal.restoreCursor(),
++            .restore_cursor => self.terminal.restoreCursor(),
 +            .invoke_charset => self.terminal.invokeCharset(value.bank, value.charset, value.locking),
 +            .configure_charset => self.terminal.configureCharset(value.slot, value.charset),
 +            .set_attribute => switch (value) {
@@ -566,17 +607,16 @@ index 000000000..d57b4e405
 +            .full_reset => self.terminal.fullReset(),
 +            .start_hyperlink => try self.terminal.screens.active.startHyperlink(value.uri, value.id),
 +            .end_hyperlink => self.terminal.screens.active.endHyperlink(),
-+            .prompt_start => {
-+                self.terminal.screens.active.cursor.page_row.semantic_prompt = .prompt;
-+                self.terminal.flags.shell_redraws_prompt = value.redraw;
-+            },
-+            .prompt_continuation => self.terminal.screens.active.cursor.page_row.semantic_prompt = .prompt_continuation,
-+            .prompt_end => self.terminal.markSemanticPrompt(.input),
-+            .end_of_input => self.terminal.markSemanticPrompt(.command),
-+            .end_of_command => self.terminal.screens.active.cursor.page_row.semantic_prompt = .input,
++            .semantic_prompt => try self.terminal.semanticPrompt(value.inner),
 +            .mouse_shape => self.terminal.mouse_shape = value,
 +            .color_operation => try self.colorOperation(value.op, &value.requests),
 +            .kitty_color_report => try self.kittyColorOperation(value),
++            .xtversion => {
++                // XTVERSION: Report terminal name and version
++                // Format: DCS >| name version ST
++                // This allows applications (like erssi) to detect terminal capabilities
++                try self.response_buffer.appendSlice(self.alloc, "\x1BP>|ghostty 1.1.0\x1B\\");
++            },
 +
 +            // Actions that require no response and have no terminal effect
 +            .dcs_hook,
@@ -590,7 +630,6 @@ index 000000000..d57b4e405
 +            .request_mode,
 +            .request_mode_unknown,
 +            .size_report,
-+            .xtversion,
 +            .kitty_keyboard_query,
 +            .window_title,
 +            .report_pwd,
@@ -600,7 +639,7 @@ index 000000000..d57b4e405
 +            .title_push,
 +            .title_pop,
 +            => {},
-+        }
++        };
 +    }
 +
 +    fn handleDeviceStatus(self: *ResponseHandler, req: device_status.Request) !void {
@@ -653,18 +692,18 @@ index 000000000..d57b4e405
 +        }
 +    }
 +
-+    inline fn horizontalTab(self: *ResponseHandler, count: u16) !void {
++    inline fn horizontalTab(self: *ResponseHandler, count: u16) void {
 +        for (0..count) |_| {
 +            const x = self.terminal.screens.active.cursor.x;
-+            try self.terminal.horizontalTab();
++            self.terminal.horizontalTab();
 +            if (x == self.terminal.screens.active.cursor.x) break;
 +        }
 +    }
 +
-+    inline fn horizontalTabBack(self: *ResponseHandler, count: u16) !void {
++    inline fn horizontalTabBack(self: *ResponseHandler, count: u16) void {
 +        for (0..count) |_| {
 +            const x = self.terminal.screens.active.cursor.x;
-+            try self.terminal.horizontalTabBack();
++            self.terminal.horizontalTabBack();
 +            if (x == self.terminal.screens.active.cursor.x) break;
 +        }
 +    }
@@ -684,7 +723,7 @@ index 000000000..d57b4e405
 +            .save_cursor => if (enabled) {
 +                self.terminal.saveCursor();
 +            } else {
-+                try self.terminal.restoreCursor();
++                self.terminal.restoreCursor();
 +            },
 +            .enable_mode_3 => {},
 +            .@"132_column" => try self.terminal.deccolm(
@@ -1393,6 +1432,63 @@ index 000000000..d57b4e405
 +}
 +
 +// ============================================================================
++// Palette / Colors API
++// ============================================================================
++
++/// Set a single palette color (index 0-255).
++/// This modifies the terminal's current palette.
++/// Call render_state_update after changing palette to see effects.
++pub fn setPaletteColor(ptr: ?*anyopaque, idx: u8, r: u8, g: u8, b: u8) callconv(.c) void {
++    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(ptr orelse return));
++    wrapper.terminal.colors.palette.current[idx] = .{ .r = r, .g = g, .b = b };
++}
++
++/// Set the default background color.
++/// Pass 0xFFFFFFFF to unset (use terminal default).
++pub fn setBackgroundColor(ptr: ?*anyopaque, rgb: u32) callconv(.c) void {
++    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(ptr orelse return));
++    if (rgb == 0xFFFFFFFF) {
++        wrapper.terminal.colors.background.override = null;
++    } else {
++        wrapper.terminal.colors.background.override = .{
++            .r = @truncate(rgb >> 16),
++            .g = @truncate(rgb >> 8),
++            .b = @truncate(rgb),
++        };
++    }
++}
++
++/// Set the default foreground color.
++/// Pass 0xFFFFFFFF to unset (use terminal default).
++pub fn setForegroundColor(ptr: ?*anyopaque, rgb: u32) callconv(.c) void {
++    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(ptr orelse return));
++    if (rgb == 0xFFFFFFFF) {
++        wrapper.terminal.colors.foreground.override = null;
++    } else {
++        wrapper.terminal.colors.foreground.override = .{
++            .r = @truncate(rgb >> 16),
++            .g = @truncate(rgb >> 8),
++            .b = @truncate(rgb),
++        };
++    }
++}
++
++/// Set the cursor color.
++/// Pass 0xFFFFFFFF to unset (use terminal default).
++pub fn setCursorColor(ptr: ?*anyopaque, rgb: u32) callconv(.c) void {
++    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(ptr orelse return));
++    if (rgb == 0xFFFFFFFF) {
++        wrapper.terminal.colors.cursor.override = null;
++    } else {
++        wrapper.terminal.colors.cursor.override = .{
++            .r = @truncate(rgb >> 16),
++            .g = @truncate(rgb >> 8),
++            .b = @truncate(rgb),
++        };
++    }
++}
++
++// ============================================================================
 +// Tests
 +// ============================================================================
 +
@@ -1423,7 +1519,7 @@ index 000000000..d57b4e405
 +    try std.testing.expectEqual(@as(u32, 'o'), cells[4].codepoint);
 +}
 diff --git a/src/terminal/render.zig b/src/terminal/render.zig
-index b6430ea34..10e0ef79d 100644
+index 9d75fe4b7..b671c52d1 100644
 --- a/src/terminal/render.zig
 +++ b/src/terminal/render.zig
 @@ -322,13 +322,14 @@ pub const RenderState = struct {
@@ -1447,3 +1543,35 @@ index b6430ea34..10e0ef79d 100644
              if (t.modes.get(.reverse_colors)) {
                  self.colors.background = fg;
                  self.colors.foreground = bg;
+diff --git a/src/terminal/stream.zig b/src/terminal/stream.zig
+index 60840d84b..f7a35aad0 100644
+--- a/src/terminal/stream.zig
++++ b/src/terminal/stream.zig
+@@ -400,7 +400,17 @@ pub const Action = union(Key) {
+         }
+     };
+ 
+-    pub const SemanticPrompt = osc.Command.SemanticPrompt;
++    pub const SemanticPrompt = struct {
++        inner: osc.Command.SemanticPrompt,
++
++        pub const C = extern struct {
++            action: u8,
++        };
++
++        pub fn cval(self: SemanticPrompt) SemanticPrompt.C {
++            return .{ .action = @intFromEnum(self.inner.action) };
++        }
++    };
+ };
+ 
+ /// Returns a type that can process a stream of tty control characters.
+@@ -1959,7 +1969,7 @@ pub fn Stream(comptime Handler: type) type {
+             switch (cmd) {
+                 .semantic_prompt => |sp| {
+                     @branchHint(.likely);
+-                    try self.handler.vt(.semantic_prompt, sp);
++                    try self.handler.vt(.semantic_prompt, .{ .inner = sp });
+                 },
+ 
+                 .change_window_title => |title| {

@@ -84,12 +84,14 @@ export type {
 } from './types';
 
 // Low-level components (for custom integrations)
-export { CanvasRenderer } from './renderer';
-export type { RendererOptions, FontMetrics, IRenderable } from './renderer';
+export type { RendererOptions, FontMetrics, IRenderable, IRenderer, IScrollbackProvider } from './interfaces';
+export { BeamtermRendererAdapter, initBeamtermWasm } from './beamterm-renderer';
+export type { BeamtermRendererOptions } from './beamterm-renderer';
 export { InputHandler } from './input-handler';
 export { EventEmitter } from './event-emitter';
-export { SelectionManager } from './selection-manager';
-export type { SelectionCoordinates } from './selection-manager';
+export { SelectionManager, SelectionMode } from './selection-manager';
+export type { SelectionManagerConfig } from './selection-manager';
+export { SelectionModel } from './selection-model';
 
 // Addons
 export { FitAddon } from './addons/fit';
@@ -100,3 +102,15 @@ export { OSC8LinkProvider } from './providers/osc8-link-provider';
 export { UrlRegexProvider } from './providers/url-regex-provider';
 export { LinkDetector } from './link-detector';
 export type { ILink, ILinkProvider, IBufferCellPosition } from './types';
+
+// Graphics (Kitty Graphics Protocol)
+export { GraphicsManager, KittyParser, ImageDecoder, GraphicsStorage, GraphicsRenderer } from './graphics';
+export type {
+  GraphicsOptions,
+  GraphicsRenderContext,
+  KittyCommand,
+  KittyAction,
+  KittyFormat,
+  StoredImage,
+  ImagePlacement,
+} from './graphics';

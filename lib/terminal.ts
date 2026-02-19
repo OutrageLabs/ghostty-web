@@ -17,7 +17,9 @@
 
 import { BufferNamespace } from './buffer';
 import { EventEmitter } from './event-emitter';
+import { invoke } from '@tauri-apps/api/core';
 import type { Ghostty, GhosttyCell, GhosttyTerminal, GhosttyTerminalConfig } from './ghostty';
+import { GraphicsManager, ImagePopup, KittyParser } from './graphics';
 import { getGhostty } from './index';
 import { InputHandler, type MouseTrackingConfig } from './input-handler';
 import type {
@@ -34,9 +36,12 @@ import type {
 import { LinkDetector } from './link-detector';
 import { OSC8LinkProvider } from './providers/osc8-link-provider';
 import { UrlRegexProvider } from './providers/url-regex-provider';
-import { CanvasRenderer } from './renderer';
-import { SelectionManager } from './selection-manager';
+import { BeamtermRendererAdapter } from './beamterm-renderer';
+import { SelectionManager, type SelectionManagerConfig } from './selection-manager';
 import type { ILink, ILinkProvider } from './types';
+
+// Renderer type - BeamtermRendererAdapter only
+type Renderer = BeamtermRendererAdapter;
 
 // ============================================================================
 // Terminal Class
@@ -65,16 +70,23 @@ export class Terminal implements ITerminalCore {
   // Components (created on open())
   private ghostty?: Ghostty;
   public wasmTerm?: GhosttyTerminal; // Made public for link providers
-  public renderer?: CanvasRenderer; // Made public for FitAddon
+  public renderer?: Renderer; // Made public for FitAddon
   private inputHandler?: InputHandler;
-  private selectionManager?: SelectionManager;
   private canvas?: HTMLCanvasElement;
+  private mouseConfig?: MouseTrackingConfig; // Debug: accessible for debug logging
 
   // Link detection system
   private linkDetector?: LinkDetector;
   private currentHoveredLink?: ILink;
   private mouseMoveThrottleTimeout?: number;
   private pendingMouseMove?: MouseEvent;
+
+  // Selection system (scroll-aware selection with auto-scroll)
+  private selectionManager?: SelectionManager;
+
+  // Graphics system (Kitty Graphics Protocol)
+  private graphicsManager?: GraphicsManager;
+  private imagePopup?: ImagePopup;
 
   // Event emitters
   private dataEmitter = new EventEmitter<string>();
@@ -146,10 +158,13 @@ export class Terminal implements ITerminalCore {
       scrollback: options.scrollback ?? 10000,
       fontSize: options.fontSize ?? 15,
       fontFamily: options.fontFamily ?? 'monospace',
+      lineHeight: options.lineHeight ?? 1.0,
       allowTransparency: options.allowTransparency ?? false,
       convertEol: options.convertEol ?? false,
       disableStdin: options.disableStdin ?? false,
       smoothScrollDuration: options.smoothScrollDuration ?? 100, // Default: 100ms smooth scroll
+      renderer: options.renderer ?? 'beamterm', // beamterm only
+      graphics: options.graphics, // Kitty graphics options
     };
 
     // Wrap in Proxy to intercept runtime changes (xterm.js compatibility)
@@ -200,8 +215,39 @@ export class Terminal implements ITerminalCore {
         break;
 
       case 'theme':
-        if (this.renderer) {
-          console.warn('ghostty-web: theme changes after open() are not yet fully supported');
+        console.log('[Terminal] Theme change detected, renderer:', !!this.renderer, 'wasmTerm:', !!this.wasmTerm);
+        if (this.wasmTerm) {
+          // Update WASM terminal palette with new theme colors
+          const t = this.options.theme;
+          this.wasmTerm.setTheme({
+            black: t.black,
+            red: t.red,
+            green: t.green,
+            yellow: t.yellow,
+            blue: t.blue,
+            magenta: t.magenta,
+            cyan: t.cyan,
+            white: t.white,
+            brightBlack: t.brightBlack,
+            brightRed: t.brightRed,
+            brightGreen: t.brightGreen,
+            brightYellow: t.brightYellow,
+            brightBlue: t.brightBlue,
+            brightMagenta: t.brightMagenta,
+            brightCyan: t.brightCyan,
+            brightWhite: t.brightWhite,
+            background: t.background,
+            foreground: t.foreground,
+            cursor: t.cursor,
+          });
+          // Update render state to pick up new palette
+          this.wasmTerm.update();
+        }
+        if (this.renderer && this.wasmTerm) {
+          // Update renderer theme and force re-render
+          console.log('[Terminal] Calling renderer.setTheme and render');
+          this.renderer.setTheme(this.options.theme);
+          this.renderer.render(this.wasmTerm, true, this.viewportY, this);
         }
         break;
 
@@ -235,19 +281,13 @@ export class Terminal implements ITerminalCore {
     if (!this.renderer || !this.wasmTerm || !this.canvas) return;
 
     // Clear any active selection since pixel positions have changed
-    if (this.selectionManager) {
-      this.selectionManager.clearSelection();
-    }
+    this.renderer?.clearSelection();
 
     // Resize canvas to match new font metrics
     this.renderer.resize(this.cols, this.rows);
 
-    // Update canvas element dimensions to match renderer
-    const metrics = this.renderer.getMetrics();
-    this.canvas.width = metrics.width * this.cols;
-    this.canvas.height = metrics.height * this.rows;
-    this.canvas.style.width = `${metrics.width * this.cols}px`;
-    this.canvas.style.height = `${metrics.height * this.rows}px`;
+    // NOTE: Canvas dimensions are set by renderer.resize() above
+    // Don't override them here to avoid DPR inconsistencies
 
     // Force full re-render with new font
     this.renderer.render(this.wasmTerm, true, this.viewportY, this);
@@ -357,11 +397,7 @@ export class Terminal implements ITerminalCore {
       // this as an input element and don't intercept keyboard events.
       parent.setAttribute('contenteditable', 'true');
       // Prevent actual content editing - we handle input ourselves
-      parent.addEventListener('beforeinput', (e) => {
-        if (e.target === parent) {
-          e.preventDefault();
-        }
-      });
+      parent.addEventListener('beforeinput', (e) => e.preventDefault());
 
       // Add accessibility attributes for screen readers and extensions
       parent.setAttribute('role', 'textbox');
@@ -413,14 +449,23 @@ export class Terminal implements ITerminalCore {
         textarea.focus();
       });
 
-      // Create renderer
-      this.renderer = new CanvasRenderer(this.canvas, {
+      // Create renderer (WebGL or Canvas2D based on option)
+      // Note: We create a closure for getSelectedCells that will be bound to
+      // the selectionManager instance created later in open()
+      const rendererOptions = {
         fontSize: this.options.fontSize,
         fontFamily: this.options.fontFamily,
+        lineHeight: this.options.lineHeight,
         cursorStyle: this.options.cursorStyle,
         cursorBlink: this.options.cursorBlink,
         theme: this.options.theme,
-      });
+        useExternalSelection: true, // Use SelectionManager for scroll-aware selection
+        // Closure that will use selectionManager when it's available
+        getSelectedCells: () => this.selectionManager?.getSelectedCellIndices() ?? null,
+      };
+
+      // Use BeamtermRendererAdapter only
+      this.renderer = new BeamtermRendererAdapter(this.canvas, rendererOptions);
 
       // Size canvas to terminal dimensions (use renderer.resize for proper DPI scaling)
       this.renderer.resize(this.cols, this.rows);
@@ -432,14 +477,37 @@ export class Terminal implements ITerminalCore {
       const mouseConfig: MouseTrackingConfig = {
         hasMouseTracking: () => wasmTerm?.hasMouseTracking() ?? false,
         hasSgrMouseMode: () => wasmTerm?.getMode(1006, false) ?? true, // SGR extended mode
-        getCellDimensions: () => ({
-          width: renderer.charWidth,
-          height: renderer.charHeight,
-        }),
+        getCellDimensions: () => {
+          // renderer.charWidth/charHeight already return CSS pixels (not physical)
+          // This ensures proper coordinate mapping for mouse events
+          return {
+            width: renderer.charWidth,
+            height: renderer.charHeight,
+          };
+        },
         getCanvasOffset: () => {
           const rect = canvas.getBoundingClientRect();
+          const debug = (window as any).subtermDebug?.canvasDebug;
+          if (debug) {
+            console.log('[Canvas] getBoundingClientRect:', rect);
+            console.log('[Canvas] clientWidth:', canvas.clientWidth, 'clientHeight:', canvas.clientHeight);
+            console.log('[Canvas] offsetWidth:', canvas.offsetWidth, 'offsetHeight:', canvas.offsetHeight);
+            console.log('[Canvas] canvas.width:', canvas.width, 'canvas.height:', canvas.height);
+            console.log('[Canvas] style.width:', canvas.style.width, 'style.height:', canvas.style.height);
+            console.log('[Canvas] DPR:', window.devicePixelRatio?.toFixed(2));
+          }
           return { left: rect.left, top: rect.top };
         },
+
+        writeDebug: async (message: string) => {
+          try {
+            await invoke('debug_write_file', { message });
+          } catch (e) {
+            // Ignore errors (debug command may not be available)
+          }
+        },
+        // Check if selection is active (don't send mouse events to PTY during selection)
+        isSelecting: () => this.selectionManager?.isSelecting() ?? false,
       };
 
       // Create input handler
@@ -450,6 +518,10 @@ export class Terminal implements ITerminalCore {
           // Check if stdin is disabled
           if (this.options.disableStdin) {
             return;
+          }
+          // Clear selection on user input (like xterm.js)
+          if (this.selectionManager?.hasSelection) {
+            this.clearSelection();
           }
           // Input handler fires data events
           this.dataEmitter.fire(data);
@@ -471,24 +543,56 @@ export class Terminal implements ITerminalCore {
           // Handle Cmd+C copy - returns true if there was a selection to copy
           return this.copySelection();
         },
-        this.textarea,
-        mouseConfig
+        mouseConfig,
+        this.options.disableDeadKeys ?? true // Default: true - send dead keys immediately
       );
 
-      // Create selection manager (pass textarea for context menu positioning)
-      this.selectionManager = new SelectionManager(
-        this,
-        this.renderer,
-        this.wasmTerm,
-        this.textarea
-      );
+      // Initialize SelectionManager for scroll-aware selection (if external selection enabled)
+      if (this.renderer.isUsingExternalSelection?.()) {
+        const selectionConfig: SelectionManagerConfig = {
+          getViewportY: () => Math.floor(this.viewportY),
+          getScrollbackLength: () => this.wasmTerm?.getScrollbackLength() ?? 0,
+          getDimensions: () => ({ rows: this.rows, cols: this.cols }),
+          getCellDimensions: () => ({
+            width: this.renderer!.charWidth,
+            height: this.renderer!.charHeight
+          }),
+          scrollBy: (lines: number) => this.scrollLines(lines),
+          getLineText: (lineIndex: number) => {
+            // lineIndex is absolute: 0=oldest scrollback, scrollbackLength=screen row 0
+            const scrollbackLength = this.wasmTerm?.getScrollbackLength() ?? 0;
+            let line: import('./types').GhosttyCell[] | null = null;
 
-      // Connect selection manager to renderer
-      this.renderer.setSelectionManager(this.selectionManager);
+            if (lineIndex < scrollbackLength) {
+              // It's in scrollback history
+              line = this.wasmTerm?.getScrollbackLine(lineIndex) ?? null;
+            } else {
+              // It's on screen
+              const screenRow = lineIndex - scrollbackLength;
+              line = this.wasmTerm?.getLine(screenRow) ?? null;
+            }
 
-      // Forward selection change events
-      this.selectionManager.onSelectionChange(() => {
-        this.selectionChangeEmitter.fire();
+            if (!line) return '';
+            return line.map(cell => cell.codepoint > 0 ? String.fromCodePoint(cell.codepoint) : ' ').join('');
+          },
+          hasMouseTracking: () => this.wasmTerm?.hasMouseTracking() ?? false,
+          // Dynamic getter for requireShift - reads current setting from renderer
+          getRequireShift: () => this.getSelectionRequireShift(),
+          renderer: this.renderer
+        };
+        this.selectionManager = new SelectionManager(selectionConfig);
+        console.log('[Terminal] SelectionManager initialized for scroll-aware selection');
+      }
+
+      // Setup paste event handler on textarea
+      this.textarea.addEventListener('paste', (e: ClipboardEvent) => {
+        e.preventDefault();
+        e.stopPropagation(); // Prevent event from bubbling to parent (InputHandler)
+        const text = e.clipboardData?.getData('text');
+        if (text) {
+          // Use the paste() method which will handle bracketed paste mode in the future
+          this.paste(text);
+        }
       });
 
       // Initialize link detection system
@@ -499,6 +603,45 @@ export class Terminal implements ITerminalCore {
       this.linkDetector.registerProvider(new OSC8LinkProvider(this));
       // URL regex second (fallback for plain text URLs)
       this.linkDetector.registerProvider(new UrlRegexProvider(this));
+
+      // Initialize graphics system (Kitty Graphics Protocol)
+      this.graphicsManager = new GraphicsManager(this.options.graphics);
+
+      // Set up graphics callbacks
+      this.graphicsManager.setCursorCallback(() => {
+        const cursor = this.wasmTerm!.getCursor();
+        return { row: cursor.y, col: cursor.x };
+      });
+
+      // Allow graphics manager to write text to WASM to sync cursor position
+      this.graphicsManager.setWriteToWasmCallback((data: string) => {
+        this.wasmTerm!.write(data);
+      });
+
+      // Provide cell dimensions for proper image sizing
+      this.graphicsManager.setCellMetricsCallback(() => {
+        const metrics = this.renderer!.getMetrics();
+        return { width: metrics.width, height: metrics.height };
+      });
+
+      // Send graphics responses back through onData
+      this.graphicsManager.setResponseCallback((response: string) => {
+        this.dataEmitter.fire(response);
+      });
+
+      // Initialize image popup for displaying graphics
+      this.imagePopup = new ImagePopup({
+        container: parent,
+        onClose: () => {
+          // Refocus terminal when popup closes
+          this.focus();
+        },
+      });
+
+      // Set up popup display callback
+      this.graphicsManager.setImageDisplayCallback((bitmap, imageId) => {
+        this.imagePopup?.show(bitmap, imageId);
+      });
 
       // Setup mouse event handling for links and scrollbar
       // Use capture phase to intercept scrollbar clicks before SelectionManager
@@ -541,19 +684,39 @@ export class Terminal implements ITerminalCore {
       data = data.replace(/\n/g, '\r\n');
     }
 
+    // Strip echoed graphics responses SYNCHRONOUSLY before async processing.
+    // This ensures echoed responses (e.g., "Gi=1;OK") are always removed,
+    // regardless of race conditions in async writeInternal.
+    if (typeof data === 'string') {
+      data = KittyParser.stripEchoedResponses(data);
+    }
+
     this.writeInternal(data, callback);
   }
 
   /**
    * Internal write implementation (extracted from write())
    */
-  private writeInternal(data: string | Uint8Array, callback?: () => void): void {
+  private async writeInternal(data: string | Uint8Array, callback?: () => void): Promise<void> {
     // Note: We intentionally do NOT clear selection on write - most modern terminals
     // preserve selection when new data arrives. Selection is cleared by user actions
     // like clicking or typing, not by incoming data.
 
-    // Write directly to WASM terminal (handles VT parsing internally)
-    this.wasmTerm!.write(data);
+    // Process graphics sequences before passing to WASM
+    // Graphics manager extracts Kitty graphics commands and returns cleaned data
+    let processedData: string | Uint8Array = data;
+    if (this.graphicsManager && typeof data === 'string') {
+      processedData = await this.graphicsManager.processData(data);
+    }
+
+    // Handle OSC color queries before passing to WASM
+    // OSC 10/11 are foreground/background color queries - respond with configured colors
+    if (typeof processedData === 'string') {
+      processedData = this.handleOSCColorQueries(processedData);
+    }
+
+    // Write to WASM terminal (handles VT parsing internally)
+    this.wasmTerm!.write(processedData);
 
     // Process any responses generated by the terminal (e.g., DSR cursor position)
     // These need to be sent back to the PTY via onData
@@ -607,6 +770,16 @@ export class Terminal implements ITerminalCore {
   }
 
   /**
+   * Normalize line endings for terminal (CRLF/LF → CR)
+   * Windows clipboard uses CRLF (\r\n), Unix uses LF (\n)
+   * Terminal expects CR (\r) for newlines
+   */
+  private normalizeLineEndings(text: string): string {
+    // Replace CRLF with CR first (Windows), then LF with CR (Unix)
+    return text.replace(/\r\n/g, '\r').replace(/\n/g, '\r');
+  }
+
+  /**
    * Paste text into terminal (triggers bracketed paste if supported)
    */
   paste(data: string): void {
@@ -617,13 +790,16 @@ export class Terminal implements ITerminalCore {
       return;
     }
 
+    // Normalize line endings (CRLF → CR, LF → CR)
+    const normalizedData = this.normalizeLineEndings(data);
+
     // Check if terminal has bracketed paste mode enabled
     if (this.wasmTerm!.hasBracketedPaste()) {
       // Wrap with bracketed paste sequences (DEC mode 2004)
-      this.dataEmitter.fire('\x1b[200~' + data + '\x1b[201~');
+      this.dataEmitter.fire('\x1b[200~' + normalizedData + '\x1b[201~');
     } else {
       // Send data directly
-      this.dataEmitter.fire(data);
+      this.dataEmitter.fire(normalizedData);
     }
   }
 
@@ -670,12 +846,8 @@ export class Terminal implements ITerminalCore {
     // Resize renderer
     this.renderer!.resize(cols, rows);
 
-    // Update canvas dimensions
-    const metrics = this.renderer!.getMetrics();
-    this.canvas!.width = metrics.width * cols;
-    this.canvas!.height = metrics.height * rows;
-    this.canvas!.style.width = `${metrics.width * cols}px`;
-    this.canvas!.style.height = `${metrics.height * rows}px`;
+    // NOTE: Canvas dimensions are set by renderer.resize() above
+    // Don't override them here to avoid DPR inconsistencies
 
     // Fire resize event
     this.resizeEmitter.fire({ cols, rows });
@@ -691,6 +863,8 @@ export class Terminal implements ITerminalCore {
     this.assertOpen();
     // Send ANSI clear screen and cursor home sequences
     this.wasmTerm!.write('\x1b[2J\x1b[H');
+    // Also clear any graphics
+    this.graphicsManager?.clear();
   }
 
   /**
@@ -754,21 +928,32 @@ export class Terminal implements ITerminalCore {
    * Get the selected text as a string
    */
   public getSelection(): string {
-    return this.selectionManager?.getSelection() || '';
+    // Beamterm auto-copies to clipboard - doesn't return text
+    // For compatibility, we return an empty string
+    return '';
   }
 
   /**
    * Check if there's an active selection
    */
   public hasSelection(): boolean {
-    return this.selectionManager?.hasSelection() || false;
+    // Prefer SelectionManager (scroll-aware) over renderer's native selection
+    if (this.selectionManager) {
+      return this.selectionManager.hasSelection;
+    }
+    return this.renderer?.hasSelection() || false;
   }
 
   /**
    * Clear the current selection
    */
   public clearSelection(): void {
-    this.selectionManager?.clearSelection();
+    // Clear both SelectionManager and renderer selection
+    if (this.selectionManager) {
+      this.selectionManager.clearSelection();
+    } else {
+      this.renderer?.clearSelection();
+    }
   }
 
   /**
@@ -776,33 +961,90 @@ export class Terminal implements ITerminalCore {
    * @returns true if there was text to copy, false otherwise
    */
   public copySelection(): boolean {
-    return this.selectionManager?.copySelection() || false;
+    // Use SelectionManager text extraction if available
+    if (this.selectionManager?.hasSelection) {
+      const text = this.selectionManager.getSelectedText();
+      if (text) {
+        this.renderer?.copyToClipboard?.(text);
+        return true;
+      }
+      return false;
+    }
+    return this.renderer?.copySelection() || false;
   }
 
   /**
    * Select all text in the terminal
+   * NOTE: Beamterm doesn't support programmatic selectAll
    */
   public selectAll(): void {
-    this.selectionManager?.selectAll();
+    // Beamterm handles selection via mouse events
+    console.warn('[Terminal] selectAll() not supported with beamterm renderer');
   }
 
   /**
    * Select text at specific column and row with length
+   * NOTE: Beamterm doesn't support programmatic selection
    */
-  public select(column: number, row: number, length: number): void {
-    this.selectionManager?.select(column, row, length);
+  public select(_column: number, _row: number, _length: number): void {
+    console.warn('[Terminal] select() not supported with beamterm renderer');
   }
 
   /**
    * Select entire lines from start to end
+   * NOTE: Beamterm doesn't support programmatic selection
    */
-  public selectLines(start: number, end: number): void {
-    this.selectionManager?.selectLines(start, end);
+  public selectLines(_start: number, _end: number): void {
+    console.warn('[Terminal] selectLines() not supported with beamterm renderer');
   }
 
   /**
-   * Get selection position as buffer range
+   * Set whether selection requires Shift+Click
+   * @param requireShift true = Shift+Click to select (default), false = direct selection
    */
+  public setSelectionRequireShift(requireShift: boolean): void {
+    const beamterm = this.renderer as import('./beamterm-renderer').BeamtermRendererAdapter;
+    if (beamterm?.setSelectionRequireShift) {
+      beamterm.setSelectionRequireShift(requireShift);
+    }
+  }
+
+  /**
+   * Get whether selection requires Shift+Click
+   */
+  public getSelectionRequireShift(): boolean {
+    const beamterm = this.renderer as import('./beamterm-renderer').BeamtermRendererAdapter;
+    return beamterm?.getSelectionRequireShift?.() ?? true;
+  }
+
+  /**
+   * Set block selection mode (Alt key toggles this)
+   * @param enabled true = Block selection, false = Linear selection (default)
+   */
+  public setBlockMode(enabled: boolean): void {
+    // Prefer SelectionManager (scroll-aware selection)
+    if (this.selectionManager) {
+      this.selectionManager.setBlockMode(enabled);
+      return;
+    }
+    const beamterm = this.renderer as import('./beamterm-renderer').BeamtermRendererAdapter;
+    if (beamterm?.setBlockMode) {
+      beamterm.setBlockMode(enabled);
+    }
+  }
+
+  /**
+   * Get current block selection mode
+   */
+  public getBlockMode(): boolean {
+    // Prefer SelectionManager (scroll-aware selection)
+    if (this.selectionManager) {
+      return this.selectionManager.getBlockMode();
+    }
+    const beamterm = this.renderer as import('./beamterm-renderer').BeamtermRendererAdapter;
+    return beamterm?.getBlockMode?.() ?? false;
+  }
+
   /**
    * Get the current viewport Y position.
    *
@@ -813,8 +1055,12 @@ export class Terminal implements ITerminalCore {
     return this.viewportY;
   }
 
+  /**
+   * Get selection position as buffer range
+   * NOTE: Beamterm doesn't return selection position
+   */
   public getSelectionPosition(): IBufferRange | undefined {
-    return this.selectionManager?.getSelectionPosition();
+    return undefined;
   }
 
   // ==========================================================================
@@ -843,6 +1089,16 @@ export class Terminal implements ITerminalCore {
     customWheelEventHandler?: (event: WheelEvent) => boolean
   ): void {
     this.customWheelEventHandler = customWheelEventHandler;
+  }
+
+  /**
+   * Set clipboard shortcut options
+   * Updates InputHandler with new settings (for runtime changes from Settings)
+   */
+  public setClipboardShortcuts(enableCtrlShiftCV: boolean, enableInsertShortcuts: boolean): void {
+    if (this.inputHandler) {
+      this.inputHandler.setClipboardShortcuts(enableCtrlShiftCV, enableInsertShortcuts);
+    }
   }
 
   // ==========================================================================
@@ -897,6 +1153,9 @@ export class Terminal implements ITerminalCore {
     if (newViewportY !== this.viewportY) {
       this.viewportY = newViewportY;
       this.scrollEmitter.fire(this.viewportY);
+
+      // Notify SelectionManager about viewport change
+      this.selectionManager?.onViewportScroll();
 
       // Show scrollbar when scrolling (with auto-hide)
       if (scrollbackLength > 0) {
@@ -1118,12 +1377,22 @@ export class Terminal implements ITerminalCore {
   private startRenderLoop(): void {
     const loop = () => {
       if (!this.isDisposed && this.isOpen) {
+        // Check if graphics need re-render (image added/removed)
+        const graphicsNeedsRender = this.graphicsManager?.checkNeedsRender() ?? false;
+
         // Render using WASM's native dirty tracking
         // The render() method:
         // 1. Calls update() once to sync state and check dirty flags
         // 2. Only redraws dirty rows when forceAll=false
         // 3. Always calls clearDirty() at the end
-        this.renderer!.render(this.wasmTerm!, false, this.viewportY, this, this.scrollbarOpacity);
+        this.renderer!.render(
+          this.wasmTerm!,
+          graphicsNeedsRender, // Force redraw if graphics changed
+          this.viewportY,
+          this,
+          this.scrollbarOpacity,
+          this.graphicsManager
+        );
 
         // Check for cursor movement (Phase 2: onCursorMove event)
         // Note: getCursor() reads from already-updated render state (from render() above)
@@ -1165,12 +1434,6 @@ export class Terminal implements ITerminalCore {
    * Clean up components (called on dispose or error)
    */
   private cleanupComponents(): void {
-    // Dispose selection manager
-    if (this.selectionManager) {
-      this.selectionManager.dispose();
-      this.selectionManager = undefined;
-    }
-
     // Dispose input handler
     if (this.inputHandler) {
       this.inputHandler.dispose();
@@ -1227,6 +1490,18 @@ export class Terminal implements ITerminalCore {
       this.linkDetector = undefined;
     }
 
+    // Dispose image popup
+    if (this.imagePopup) {
+      this.imagePopup.dispose();
+      this.imagePopup = undefined;
+    }
+
+    // Dispose graphics manager
+    if (this.graphicsManager) {
+      this.graphicsManager.dispose();
+      this.graphicsManager = undefined;
+    }
+
     // Free WASM terminal
     if (this.wasmTerm) {
       this.wasmTerm.free();
@@ -1257,6 +1532,14 @@ export class Terminal implements ITerminalCore {
    */
   private handleMouseMove = (e: MouseEvent): void => {
     if (!this.canvas || !this.renderer || !this.wasmTerm) return;
+
+    // Handle SelectionManager mouse move (for drag selection)
+    if (this.selectionManager?.isSelecting()) {
+      this.selectionManager.onMouseMove(e);
+      // Note: We do NOT use stopPropagation() here
+      // InputHandler will check selectionManager.isSelecting() and skip sending mouse events to PTY
+      // Continue for link detection and cursor updates
+    }
 
     // If dragging scrollbar, handle immediately without throttling
     if (this.isDraggingScrollbar) {
@@ -1498,14 +1781,36 @@ export class Terminal implements ITerminalCore {
    * Handle wheel events for scrolling (Phase 2)
    */
   private handleWheel = (e: WheelEvent): void => {
-    // Always prevent default browser scrolling
-    e.preventDefault();
-    e.stopPropagation();
-
     // Allow custom handler to override
     if (this.customWheelEventHandler && this.customWheelEventHandler(e)) {
+      e.preventDefault();
+      e.stopPropagation();
       return;
     }
+
+    // SelectionManager wheel handling: scroll during active selection
+    // This allows scrolling through history while selecting text
+    if (this.selectionManager?.isSelecting()) {
+      if (this.selectionManager.onWheel(e)) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+    }
+
+    // Check if mouse tracking is enabled (for applications like irssi, tmux, etc.)
+    // If mouse tracking is active, let InputHandler handle the wheel event
+    // InputHandler will send mouse wheel events to the application
+    const hasMouseTracking = this.wasmTerm?.hasMouseTracking() ?? false;
+    if (hasMouseTracking) {
+      // Don't prevent default here - let InputHandler handle it
+      // InputHandler will prevent default if it processes the event
+      return;
+    }
+
+    // Always prevent default browser scrolling for terminal scrolling
+    e.preventDefault();
+    e.stopPropagation();
 
     // Check if in alternate screen mode (vim, less, htop, etc.)
     const isAltScreen = this.wasmTerm?.isAlternateScreen() ?? false;
@@ -1557,10 +1862,21 @@ export class Terminal implements ITerminalCore {
   };
 
   /**
-   * Handle mouse down for scrollbar interaction
+   * Handle mouse down for scrollbar interaction and selection
    */
   private handleMouseDown = (e: MouseEvent): void => {
     if (!this.canvas || !this.renderer || !this.wasmTerm) return;
+
+    // Try SelectionManager first (for scroll-aware selection)
+    if (this.selectionManager) {
+      const handled = this.selectionManager.onMouseDown(e);
+      if (handled) {
+        e.preventDefault();
+        // Note: We do NOT use stopPropagation() here
+        // InputHandler will check selectionManager.isSelecting() and skip sending mouse events to PTY
+        return;
+      }
+    }
 
     const scrollbackLength = this.wasmTerm.getScrollbackLength();
     if (scrollbackLength === 0) return; // No scrollbar if no scrollback
@@ -1615,9 +1931,16 @@ export class Terminal implements ITerminalCore {
   };
 
   /**
-   * Handle mouse up for scrollbar drag
+   * Handle mouse up for scrollbar drag and selection
    */
-  private handleMouseUp = (): void => {
+  private handleMouseUp = (e: MouseEvent): void => {
+    // Handle SelectionManager mouse up
+    if (this.selectionManager?.isSelecting()) {
+      this.selectionManager.onMouseUp(e);
+      // Note: We do NOT use stopPropagation() here
+      // InputHandler will check selectionManager.isSelecting() and skip sending mouse events to PTY
+    }
+
     if (this.isDraggingScrollbar) {
       this.isDraggingScrollbar = false;
       this.scrollbarDragStart = null;
@@ -1817,6 +2140,85 @@ export class Terminal implements ITerminalCore {
     }
   }
 
+  /**
+   * Handle OSC color queries (OSC 10, 11, etc.)
+   *
+   * Applications like chafa send OSC 10/11 queries to determine terminal colors.
+   * We intercept these and respond with the configured theme colors, preventing
+   * the WASM parser from logging warnings about unsupported sequences.
+   *
+   * @param data - Terminal data to process
+   * @returns Data with OSC color queries removed
+   */
+  private handleOSCColorQueries(data: string): string {
+    // OSC query format: ESC ] Ps ; ? BEL  or  ESC ] Ps ; ? ESC \
+    // OSC 10 = foreground, OSC 11 = background, OSC 12 = cursor
+    const oscQueryRegex = /\x1b\](10|11|12);\?(?:\x07|\x1b\\)/g;
+
+    let result = data;
+    let match: RegExpExecArray | null = null;
+
+    // biome-ignore lint/suspicious/noAssignInExpressions: Standard regex pattern
+    while ((match = oscQueryRegex.exec(data)) !== null) {
+      const oscType = match[1];
+      let colorHex: string | undefined;
+
+      // Get color from theme
+      if (oscType === '10') {
+        // Foreground color
+        colorHex = this.options.theme?.foreground ?? '#d4d4d4';
+      } else if (oscType === '11') {
+        // Background color
+        colorHex = this.options.theme?.background ?? '#1e1e1e';
+      } else if (oscType === '12') {
+        // Cursor color (use foreground if not specified)
+        colorHex = this.options.theme?.cursor ?? this.options.theme?.foreground ?? '#d4d4d4';
+      }
+
+      if (colorHex) {
+        // Convert hex to X11 format: rgb:rrrr/gggg/bbbb
+        const rgb = this.hexToX11Color(colorHex);
+        // Send response: ESC ] Ps ; rgb:rrrr/gggg/bbbb BEL
+        const response = `\x1b]${oscType};${rgb}\x07`;
+        this.dataEmitter.fire(response);
+      }
+    }
+
+    // Remove OSC queries from data (they've been handled)
+    result = data.replace(oscQueryRegex, '');
+
+    return result;
+  }
+
+  /**
+   * Convert hex color to X11 color format (rgb:rrrr/gggg/bbbb)
+   */
+  private hexToX11Color(hex: string): string {
+    // Remove # if present
+    hex = hex.replace(/^#/, '');
+
+    // Parse RGB values
+    let r: number, g: number, b: number;
+    if (hex.length === 3) {
+      // Short format (#RGB)
+      r = Number.parseInt(hex[0] + hex[0], 16);
+      g = Number.parseInt(hex[1] + hex[1], 16);
+      b = Number.parseInt(hex[2] + hex[2], 16);
+    } else {
+      // Full format (#RRGGBB)
+      r = Number.parseInt(hex.substring(0, 2), 16);
+      g = Number.parseInt(hex.substring(2, 4), 16);
+      b = Number.parseInt(hex.substring(4, 6), 16);
+    }
+
+    // Scale to 16-bit and format as X11 color
+    const r16 = ((r << 8) | r).toString(16).padStart(4, '0');
+    const g16 = ((g << 8) | g).toString(16).padStart(4, '0');
+    const b16 = ((b << 8) | b).toString(16).padStart(4, '0');
+
+    return `rgb:${r16}/${g16}/${b16}`;
+  }
+
   // ============================================================================
   // Terminal Modes
   // ============================================================================
@@ -1855,5 +2257,42 @@ export class Terminal implements ITerminalCore {
   public hasMouseTracking(): boolean {
     this.assertOpen();
     return this.wasmTerm!.hasMouseTracking();
+  }
+
+  // ============================================================================
+  // Graphics API (Kitty Graphics Protocol)
+  // ============================================================================
+
+  /**
+   * Enable or disable Kitty graphics support
+   */
+  public setGraphicsEnabled(enabled: boolean): void {
+    this.graphicsManager?.setEnabled(enabled);
+  }
+
+  /**
+   * Check if graphics are enabled
+   */
+  public isGraphicsEnabled(): boolean {
+    return this.graphicsManager?.isEnabled() ?? false;
+  }
+
+  /**
+   * Clear all graphics from the terminal
+   */
+  public clearGraphics(): void {
+    this.graphicsManager?.clear();
+  }
+
+  /**
+   * Get graphics storage statistics
+   */
+  public getGraphicsStats(): {
+    imageCount: number;
+    placementCount: number;
+    memoryUsage: number;
+    maxMemory: number;
+  } | null {
+    return this.graphicsManager?.getStats() ?? null;
   }
 }

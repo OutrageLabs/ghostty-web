@@ -463,6 +463,12 @@ export interface GhosttyWasmExports extends WebAssembly.Exports {
   // Response API (for DSR and other terminal queries)
   ghostty_terminal_has_response(terminal: TerminalHandle): boolean;
   ghostty_terminal_read_response(terminal: TerminalHandle, bufPtr: number, bufLen: number): number; // Returns bytes written, 0 if no response, -1 on error
+
+  // Palette / Colors API
+  ghostty_terminal_set_palette_color(terminal: TerminalHandle, index: number, r: number, g: number, b: number): void;
+  ghostty_terminal_set_background_color(terminal: TerminalHandle, rgb: number): void; // 0xRRGGBB, or 0xFFFFFFFF to unset
+  ghostty_terminal_set_foreground_color(terminal: TerminalHandle, rgb: number): void; // 0xRRGGBB, or 0xFFFFFFFF to unset
+  ghostty_terminal_set_cursor_color(terminal: TerminalHandle, rgb: number): void; // 0xRRGGBB, or 0xFFFFFFFF to unset
 }
 
 // ============================================================================
@@ -489,7 +495,7 @@ export interface RenderStateCursor {
   viewportY: number;
   visible: boolean;
   blinking: boolean;
-  style: 'block' | 'underline' | 'bar';
+  style: 'block' | 'underline';
 }
 
 /**

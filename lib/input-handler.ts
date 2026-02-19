@@ -154,6 +154,79 @@ const KEY_MAP: Record<string, Key> = {
 };
 
 /**
+ * Map KeyboardEvent.code to base characters (without modifiers)
+ * Used to detect if Alt/Option produced a transformed character (like ą)
+ * or the same character (like 1) - in the latter case we send ESC+char
+ */
+const BASE_CHAR_MAP: Record<string, string> = {
+  // Numbers - Alt+digit should send ESC+digit for apps like irssi
+  Digit0: '0',
+  Digit1: '1',
+  Digit2: '2',
+  Digit3: '3',
+  Digit4: '4',
+  Digit5: '5',
+  Digit6: '6',
+  Digit7: '7',
+  Digit8: '8',
+  Digit9: '9',
+  // Letters
+  KeyA: 'a',
+  KeyB: 'b',
+  KeyC: 'c',
+  KeyD: 'd',
+  KeyE: 'e',
+  KeyF: 'f',
+  KeyG: 'g',
+  KeyH: 'h',
+  KeyI: 'i',
+  KeyJ: 'j',
+  KeyK: 'k',
+  KeyL: 'l',
+  KeyM: 'm',
+  KeyN: 'n',
+  KeyO: 'o',
+  KeyP: 'p',
+  KeyQ: 'q',
+  KeyR: 'r',
+  KeyS: 's',
+  KeyT: 't',
+  KeyU: 'u',
+  KeyV: 'v',
+  KeyW: 'w',
+  KeyX: 'x',
+  KeyY: 'y',
+  KeyZ: 'z',
+  // Punctuation
+  Minus: '-',
+  Equal: '=',
+  BracketLeft: '[',
+  BracketRight: ']',
+  Backslash: '\\',
+  Semicolon: ';',
+  Quote: "'",
+  Backquote: '`',
+  Comma: ',',
+  Period: '.',
+  Slash: '/',
+  Space: ' ',
+};
+
+/**
+ * Dead key mapping: event.code + shift → character
+ * Used when disableDeadKeys is enabled to send dead key characters immediately
+ * instead of waiting for composition (Windows US International keyboard, etc.)
+ */
+const DEAD_KEY_MAP: Record<string, { normal: string; shift: string }> = {
+  // Tilde/Grave - most common dead key issue
+  Backquote: { normal: '`', shift: '~' },
+  // Caret (on some layouts)
+  Digit6: { normal: '6', shift: '^' },
+  // Acute accent (on some layouts, Quote key)
+  Quote: { normal: "'", shift: '"' },
+};
+
+/**
  * InputHandler class
  * Attaches keyboard event listeners to a container and converts
  * keyboard events to terminal input data
@@ -170,12 +243,15 @@ export interface MouseTrackingConfig {
   getCellDimensions: () => { width: number; height: number };
   /** Get canvas/container offset for accurate position calculation */
   getCanvasOffset: () => { left: number; top: number };
+  /** Check if selection is currently in progress (don't send mouse events to PTY) */
+  isSelecting?: () => boolean;
+  /** Write debug info to terminal (when DevTools are not available) */
+  writeDebug?: (message: string) => Promise<void>;
 }
 
 export class InputHandler {
   private encoder: KeyEncoder;
   private container: HTMLElement;
-  private inputElement?: HTMLElement;
   private onDataCallback: (data: string) => void;
   private onBellCallback: () => void;
   private onKeyCallback?: (keyEvent: IKeyEvent) => void;
@@ -186,27 +262,20 @@ export class InputHandler {
   private keydownListener: ((e: KeyboardEvent) => void) | null = null;
   private keypressListener: ((e: KeyboardEvent) => void) | null = null;
   private pasteListener: ((e: ClipboardEvent) => void) | null = null;
-  private beforeInputListener: ((e: InputEvent) => void) | null = null;
   private compositionStartListener: ((e: CompositionEvent) => void) | null = null;
   private compositionUpdateListener: ((e: CompositionEvent) => void) | null = null;
   private compositionEndListener: ((e: CompositionEvent) => void) | null = null;
   private mousedownListener: ((e: MouseEvent) => void) | null = null;
   private mouseupListener: ((e: MouseEvent) => void) | null = null;
+  private mouseupDocumentListener: ((e: MouseEvent) => void) | null = null; // Document-level to catch releases outside container
   private mousemoveListener: ((e: MouseEvent) => void) | null = null;
   private wheelListener: ((e: WheelEvent) => void) | null = null;
   private isComposing = false;
   private isDisposed = false;
   private mouseButtonsPressed = 0; // Track which buttons are pressed for motion reporting
-  private lastKeyDownData: string | null = null;
-  private lastKeyDownTime = 0;
-  private lastPasteData: string | null = null;
-  private lastPasteTime = 0;
-  private lastPasteSource: 'paste' | 'beforeinput' | null = null;
-  private lastCompositionData: string | null = null;
-  private lastCompositionTime = 0;
-  private lastBeforeInputData: string | null = null;
-  private lastBeforeInputTime = 0;
-  private static readonly BEFORE_INPUT_IGNORE_MS = 100;
+  private enableCtrlShiftCV = true;  // Ctrl+Shift+C/V shortcuts (modern style)
+  private enableInsertShortcuts = false;  // Ctrl+Insert/Shift+Insert shortcuts (classic style)
+  private disableDeadKeys = true;  // Send dead key chars immediately (default: true for terminals)
 
   /**
    * Create a new InputHandler
@@ -218,8 +287,8 @@ export class InputHandler {
    * @param customKeyEventHandler - Optional custom key event handler
    * @param getMode - Optional callback to query terminal mode state (for application cursor mode)
    * @param onCopy - Optional callback to handle copy (Cmd+C/Ctrl+C with selection)
-   * @param inputElement - Optional input element for beforeinput events
    * @param mouseConfig - Optional mouse tracking configuration
+   * @param disableDeadKeys - Send dead key chars immediately (default: true)
    */
   constructor(
     ghostty: Ghostty,
@@ -230,12 +299,11 @@ export class InputHandler {
     customKeyEventHandler?: (event: KeyboardEvent) => boolean,
     getMode?: (mode: number) => boolean,
     onCopy?: () => boolean,
-    inputElement?: HTMLElement,
-    mouseConfig?: MouseTrackingConfig
+    mouseConfig?: MouseTrackingConfig,
+    disableDeadKeys?: boolean
   ) {
     this.encoder = ghostty.createKeyEncoder();
     this.container = container;
-    this.inputElement = inputElement;
     this.onDataCallback = onData;
     this.onBellCallback = onBell;
     this.onKeyCallback = onKey;
@@ -243,6 +311,7 @@ export class InputHandler {
     this.getModeCallback = getMode;
     this.onCopyCallback = onCopy;
     this.mouseConfig = mouseConfig;
+    this.disableDeadKeys = disableDeadKeys ?? true; // Default: true for terminal apps
 
     // Attach event listeners
     this.attach();
@@ -253,6 +322,23 @@ export class InputHandler {
    */
   setCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean): void {
     this.customKeyEventHandler = handler;
+  }
+
+  /**
+   * Set clipboard shortcut options (for runtime updates from settings)
+   */
+  setClipboardShortcuts(enableCtrlShiftCV: boolean, enableInsertShortcuts: boolean): void {
+    this.enableCtrlShiftCV = enableCtrlShiftCV;
+    this.enableInsertShortcuts = enableInsertShortcuts;
+  }
+
+  /**
+   * Set dead key handling option (for runtime updates from settings)
+   * When true, dead keys (like ~ on Windows US International keyboard) are sent
+   * immediately instead of waiting for composition.
+   */
+  setDisableDeadKeys(disable: boolean): void {
+    this.disableDeadKeys = disable;
   }
 
   /**
@@ -279,14 +365,6 @@ export class InputHandler {
 
     this.pasteListener = this.handlePaste.bind(this);
     this.container.addEventListener('paste', this.pasteListener);
-    if (this.inputElement && this.inputElement !== this.container) {
-      this.inputElement.addEventListener('paste', this.pasteListener);
-    }
-
-    if (this.inputElement) {
-      this.beforeInputListener = this.handleBeforeInput.bind(this);
-      this.inputElement.addEventListener('beforeinput', this.beforeInputListener);
-    }
 
     this.compositionStartListener = this.handleCompositionStart.bind(this);
     this.container.addEventListener('compositionstart', this.compositionStartListener);
@@ -303,6 +381,12 @@ export class InputHandler {
 
     this.mouseupListener = this.handleMouseUp.bind(this);
     this.container.addEventListener('mouseup', this.mouseupListener);
+
+    // Document-level mouseup to catch button releases outside container
+    // This ensures mouseButtonsPressed is properly cleared even when user
+    // releases mouse during drag selection (which happens outside container)
+    this.mouseupDocumentListener = this.handleMouseUpDocument.bind(this);
+    document.addEventListener('mouseup', this.mouseupDocumentListener);
 
     this.mousemoveListener = this.handleMouseMove.bind(this);
     this.container.addEventListener('mousemove', this.mousemoveListener);
@@ -343,17 +427,54 @@ export class InputHandler {
   /**
    * Check if this is a printable character with no special modifiers
    * @param event - KeyboardEvent
-   * @returns true if printable character
+   * @returns true if printable character (should be sent directly)
+   * @returns false if should be processed by encoder (for ESC sequences etc.)
    */
   private isPrintableCharacter(event: KeyboardEvent): boolean {
+    // If key produces a single printable character, check if it's already processed
+    // (e.g., Option+a on macOS produces 'ą' directly in event.key)
+    if (event.key.length === 1) {
+      const charCode = event.key.charCodeAt(0);
+      // Check if it's a printable character (not a control character)
+      if (charCode >= 32 && charCode !== 127) {
+        // Block Ctrl (without Alt) and Meta
+        if (event.ctrlKey && !event.altKey) return false;
+        if (event.metaKey) return false; // Cmd key on Mac
+
+        // Handle Alt/Option key:
+        // - If Alt produced a DIFFERENT character (a→ą), send the character
+        // - If Alt produced the SAME character (1→1), return false to send ESC+char
+        if (event.altKey && !event.ctrlKey) {
+          const baseChar = BASE_CHAR_MAP[event.code];
+          if (baseChar !== undefined) {
+            // Check if the character was transformed by Alt/Option
+            const keyLower = event.key.toLowerCase();
+            if (keyLower === baseChar || keyLower === baseChar.toUpperCase()) {
+              // Same character - Alt+1 gives '1', Alt+a gives 'a'
+              // Return false so encoder sends ESC+char (for irssi, etc.)
+              return false;
+            }
+            // Different character - Alt+a gives 'ą' on Polish keyboard
+            // Send the transformed character directly
+            return true;
+          }
+          // Unknown key code - let encoder handle it
+          return false;
+        }
+
+        // No Alt/Ctrl/Meta - it's a simple printable character
+        return true;
+      }
+    }
+
+    // For non-printable or multi-character keys, check modifiers
     // If Ctrl, Alt, or Meta (Cmd on Mac) is pressed, it's not a simple printable character
     // Exception: AltGr (Ctrl+Alt on some keyboards) can produce printable characters
     if (event.ctrlKey && !event.altKey) return false;
     if (event.altKey && !event.ctrlKey) return false;
     if (event.metaKey) return false; // Cmd key on Mac
 
-    // If key produces a single printable character
-    return event.key.length === 1;
+    return false;
   }
 
   /**
@@ -362,6 +483,24 @@ export class InputHandler {
    */
   private handleKeyDown(event: KeyboardEvent): void {
     if (this.isDisposed) return;
+
+    // Handle dead keys (Windows US International keyboard, etc.)
+    // Dead keys send event.key === 'Dead' instead of the actual character
+    if (event.key === 'Dead') {
+      if (this.disableDeadKeys) {
+        // Send the character immediately instead of waiting for composition
+        const mapping = DEAD_KEY_MAP[event.code];
+        if (mapping) {
+          const char = event.shiftKey ? mapping.shift : mapping.normal;
+          event.preventDefault();
+          event.stopPropagation();
+          this.onDataCallback(char);
+        }
+      }
+      // Whether we handled it or not, return early for dead keys
+      // If disableDeadKeys is false, let the system handle composition
+      return;
+    }
 
     // Ignore keydown events during composition
     // Note: Some browsers send keyCode 229 for all keys during composition
@@ -382,6 +521,38 @@ export class InputHandler {
         event.preventDefault();
         return;
       }
+    }
+
+    // Handle Ctrl+Shift+C for copy (modern terminal style)
+    if (this.enableCtrlShiftCV && event.ctrlKey && event.shiftKey && event.code === 'KeyC') {
+      if (this.onCopyCallback && this.onCopyCallback()) {
+        event.preventDefault();
+      }
+      return;
+    }
+
+    // Handle Ctrl+Shift+V for paste (modern terminal style)
+    // Browser doesn't natively handle Ctrl+Shift+V, so we read clipboard manually
+    if (this.enableCtrlShiftCV && event.ctrlKey && event.shiftKey && event.code === 'KeyV') {
+      event.preventDefault();
+      this.pasteFromClipboard();
+      return;
+    }
+
+    // Handle Ctrl+Insert for copy (classic PuTTY/DOS style)
+    if (this.enableInsertShortcuts && event.ctrlKey && !event.shiftKey && event.code === 'Insert') {
+      if (this.onCopyCallback && this.onCopyCallback()) {
+        event.preventDefault();
+      }
+      return;
+    }
+
+    // Handle Shift+Insert for paste (classic PuTTY/DOS style)
+    // Browser doesn't natively handle Shift+Insert, so we need to read clipboard manually
+    if (this.enableInsertShortcuts && event.shiftKey && !event.ctrlKey && event.code === 'Insert') {
+      event.preventDefault();
+      this.pasteFromClipboard();
+      return;
     }
 
     // Allow Ctrl+V and Cmd+V to trigger paste event (don't preventDefault)
@@ -407,7 +578,6 @@ export class InputHandler {
     if (this.isPrintableCharacter(event)) {
       event.preventDefault();
       this.onDataCallback(event.key);
-      this.recordKeyDownData(event.key);
       return;
     }
 
@@ -427,11 +597,17 @@ export class InputHandler {
 
       switch (key) {
         case Key.ENTER:
-          simpleOutput = '\r'; // Carriage return
+          if (event.shiftKey) {
+            // Shift+Enter: send CSI u sequence so AI tools (Claude Code, Codex, etc.)
+            // can distinguish it from plain Enter (newline without submit)
+            simpleOutput = '\x1b[13;2u';
+          } else {
+            simpleOutput = '\r'; // Carriage return
+          }
           break;
         case Key.TAB:
-          if (mods === Mods.SHIFT) {
-            simpleOutput = '\x1b[Z'; // Backtab
+          if (event.shiftKey) {
+            simpleOutput = '\x1b[Z'; // Backtab (Shift+Tab)
           } else {
             simpleOutput = '\t'; // Tab
           }
@@ -504,7 +680,6 @@ export class InputHandler {
       if (simpleOutput !== null) {
         event.preventDefault();
         this.onDataCallback(simpleOutput);
-        this.recordKeyDownData(simpleOutput);
         return;
       }
     }
@@ -520,6 +695,10 @@ export class InputHandler {
         const appCursorMode = this.getModeCallback(1);
         this.encoder.setOption(KeyEncoderOption.CURSOR_KEY_APPLICATION, appCursorMode);
       }
+
+      // Enable Alt/Meta sending ESC prefix (e.g., Alt+1 → ESC 1)
+      // This is required for apps like irssi that use Alt+number for window switching
+      this.encoder.setOption(KeyEncoderOption.ALT_ESC_PREFIX, true);
 
       // For letter/number keys, even with modifiers, pass the base character
       // This helps the encoder produce correct control sequences (e.g., Ctrl+A = 0x01)
@@ -547,7 +726,6 @@ export class InputHandler {
       // Emit the data
       if (data.length > 0) {
         this.onDataCallback(data);
-        this.recordKeyDownData(data);
       }
     } catch (error) {
       // Encoding failed - log but don't crash
@@ -556,8 +734,52 @@ export class InputHandler {
   }
 
   /**
-   * Handle paste event from clipboard
-   * @param event - ClipboardEvent
+   * Normalize line endings for terminal paste
+   * Windows uses CRLF (\r\n), Mac uses CR (\r), Unix uses LF (\n)
+   * Terminal expects just CR (\r) for newlines
+   */
+  private normalizeLineEndings(text: string): string {
+    // Replace CRLF with CR first (Windows), then LF with CR (Unix)
+    return text.replace(/\r\n/g, '\r').replace(/\n/g, '\r');
+  }
+
+  /**
+   * Send text to terminal with proper formatting
+   */
+  private sendPasteText(text: string): void {
+    // Normalize line endings for terminal
+    const normalizedText = this.normalizeLineEndings(text);
+
+    // Check if bracketed paste mode is enabled (DEC mode 2004)
+    const hasBracketedPaste = this.getModeCallback?.(2004) ?? false;
+
+    if (hasBracketedPaste) {
+      // Wrap with bracketed paste sequences
+      this.onDataCallback('\x1b[200~' + normalizedText + '\x1b[201~');
+    } else {
+      // Send raw text
+      this.onDataCallback(normalizedText);
+    }
+  }
+
+  /**
+   * Read from clipboard and paste (for keyboard shortcuts like Shift+Insert)
+   */
+  private async pasteFromClipboard(): Promise<void> {
+    if (this.isDisposed) return;
+
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        this.sendPasteText(text);
+      }
+    } catch (error) {
+      console.warn('Failed to read clipboard:', error);
+    }
+  }
+
+  /**
+   * Handle paste event from clipboard (Ctrl+V, Cmd+V)
    */
   private handlePaste(event: ClipboardEvent): void {
     if (this.isDisposed) return;
@@ -580,84 +802,7 @@ export class InputHandler {
       return;
     }
 
-    if (this.shouldIgnorePasteEvent(text, 'paste')) {
-      return;
-    }
-
-    this.emitPasteData(text);
-    this.recordPasteData(text, 'paste');
-  }
-
-  /**
-   * Handle beforeinput event (mobile/IME input)
-   * @param event - InputEvent
-   */
-  private handleBeforeInput(event: InputEvent): void {
-    if (this.isDisposed) return;
-
-    if (this.isComposing || event.isComposing) {
-      return;
-    }
-
-    const inputType = event.inputType;
-    const data = event.data ?? '';
-    let output: string | null = null;
-
-    switch (inputType) {
-      case 'insertText':
-      case 'insertReplacementText':
-        output = data.length > 0 ? data.replace(/\n/g, '\r') : null;
-        break;
-      case 'insertLineBreak':
-      case 'insertParagraph':
-        output = '\r';
-        break;
-      case 'deleteContentBackward':
-        output = '\x7F';
-        break;
-      case 'deleteContentForward':
-        output = '\x1B[3~';
-        break;
-      case 'insertFromPaste':
-        if (!data) {
-          return;
-        }
-        if (this.shouldIgnorePasteEvent(data, 'beforeinput')) {
-          event.preventDefault();
-          event.stopPropagation();
-          return;
-        }
-        event.preventDefault();
-        event.stopPropagation();
-        this.emitPasteData(data);
-        this.recordPasteData(data, 'beforeinput');
-        return;
-      default:
-        return;
-    }
-
-    if (!output) {
-      return;
-    }
-
-    if (this.shouldIgnoreBeforeInput(output)) {
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
-
-    if (data && this.shouldIgnoreBeforeInputFromComposition(data)) {
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
-
-    event.preventDefault();
-    event.stopPropagation();
-    this.onDataCallback(output);
-    if (data) {
-      this.recordBeforeInputData(data);
-    }
+    this.sendPasteText(text);
   }
 
   /**
@@ -687,21 +832,9 @@ export class InputHandler {
 
     const data = event.data;
     if (data && data.length > 0) {
-      if (this.shouldIgnoreCompositionEnd(data)) {
-        this.cleanupCompositionTextNodes();
-        return;
-      }
       this.onDataCallback(data);
-      this.recordCompositionData(data);
     }
 
-    this.cleanupCompositionTextNodes();
-  }
-
-  /**
-   * Cleanup text nodes in container after composition
-   */
-  private cleanupCompositionTextNodes(): void {
     // Cleanup text nodes in container (fix for duplicate text display)
     // When the container is contenteditable, the browser might insert text nodes
     // upon composition end. We need to remove them to prevent duplicate display.
@@ -722,21 +855,41 @@ export class InputHandler {
 
   /**
    * Convert pixel coordinates to terminal cell coordinates
+   * 
+   * Uses clientX/clientY with getBoundingClientRect() for canvas, which is more reliable
+   * across platforms (especially Windows with high DPI) because it accounts for:
+   * - Device pixel ratio (DPR)
+   * - Canvas position relative to viewport
+   * - Any padding/borders on the container
+   * 
+   * Note: Events are attached to container, but we need coordinates relative to canvas.
    */
   private pixelToCell(event: MouseEvent): { col: number; row: number } | null {
     if (!this.mouseConfig) return null;
 
     const dims = this.mouseConfig.getCellDimensions();
-    const offset = this.mouseConfig.getCanvasOffset();
 
     if (dims.width <= 0 || dims.height <= 0) return null;
 
+    // Always use clientX/clientY with getBoundingClientRect() for canvas
+    // This is the most reliable method across platforms, especially Windows with high DPI
+    // clientX/clientY are in CSS pixels, and getBoundingClientRect() accounts for DPR
+    const offset = this.mouseConfig.getCanvasOffset();
     const x = event.clientX - offset.left;
     const y = event.clientY - offset.top;
 
     // Convert to 1-based cell coordinates (terminal uses 1-based)
     const col = Math.floor(x / dims.width) + 1;
     const row = Math.floor(y / dims.height) + 1;
+
+    // Debug logging (always show in terminal when mouse clicks)
+    const dpr = window.devicePixelRatio || 1;
+    if ((window as any).subtermDebug?.mouseDebug || true) {
+      const debugInfo = `MOUSE: col=${col}, row=${row}, x=${x.toFixed(1)}, y=${y.toFixed(1)}, dims=${dims.width.toFixed(1)}x${dims.height.toFixed(1)}, DPR=${dpr.toFixed(2)}`;
+      if (this.mouseConfig && this.mouseConfig.writeDebug) {
+        this.mouseConfig.writeDebug(debugInfo).catch(() => {});
+      }
+    }
 
     // Clamp to valid range (at least 1)
     return {
@@ -776,7 +929,12 @@ export class InputHandler {
    * Encode mouse event as X10/normal sequence (legacy format)
    * Format: \x1b[M<Btn+32><Col+32><Row+32>
    */
-  private encodeMouseX10(button: number, col: number, row: number, modifiers: number): string {
+  private encodeMouseX10(
+    button: number,
+    col: number,
+    row: number,
+    modifiers: number
+  ): string {
     // X10 format adds 32 to all values and encodes as characters
     // Button encoding: 0=left, 1=middle, 2=right, 3=release
     const btn = button + modifiers + 32;
@@ -820,6 +978,9 @@ export class InputHandler {
     if (this.isDisposed) return;
     if (!this.mouseConfig?.hasMouseTracking()) return;
 
+    // Don't send mouse events to PTY if selection is active
+    if (this.mouseConfig.isSelecting?.()) return;
+
     const cell = this.pixelToCell(event);
     if (!cell) return;
 
@@ -845,6 +1006,9 @@ export class InputHandler {
     if (this.isDisposed) return;
     if (!this.mouseConfig?.hasMouseTracking()) return;
 
+    // Don't send mouse events to PTY if selection is active
+    if (this.mouseConfig.isSelecting?.()) return;
+
     const cell = this.pixelToCell(event);
     if (!cell) return;
 
@@ -857,11 +1021,27 @@ export class InputHandler {
   }
 
   /**
+   * Handle mouseup on document level - ensures button state is properly cleared
+   * even when mouse is released outside the container (e.g., during drag selection)
+   */
+  private handleMouseUpDocument(event: MouseEvent): void {
+    if (this.isDisposed) return;
+
+    // Always clear the pressed button state, regardless of mouse tracking or selection
+    // This prevents "phantom button pressed" state after drag selection
+    const button = event.button;
+    this.mouseButtonsPressed &= ~(1 << button);
+  }
+
+  /**
    * Handle mousemove event
    */
   private handleMouseMove(event: MouseEvent): void {
     if (this.isDisposed) return;
     if (!this.mouseConfig?.hasMouseTracking()) return;
+
+    // Don't send mouse events to PTY if selection is active
+    if (this.mouseConfig.isSelecting?.()) return;
 
     // Check if button motion mode or any-event tracking is enabled
     // Mode 1002 = button motion, Mode 1003 = any motion
@@ -876,13 +1056,14 @@ export class InputHandler {
     const cell = this.pixelToCell(event);
     if (!cell) return;
 
-    // Determine which button to report (or 32 for motion with no button)
-    let button = 32; // Motion flag
-    if (this.mouseButtonsPressed & 1)
-      button += 0; // Left
-    else if (this.mouseButtonsPressed & 2)
-      button += 1; // Middle
-    else if (this.mouseButtonsPressed & 4) button += 2; // Right
+    // Determine which button to report for motion event
+    // XTerm SGR protocol: button codes are base + 32 (motion flag)
+    // Base: 0=left, 1=middle, 2=right, 3=release/no-button
+    let button: number;
+    if (this.mouseButtonsPressed & 1) button = 0 + 32; // Left motion = 32
+    else if (this.mouseButtonsPressed & 2) button = 1 + 32; // Middle motion = 33
+    else if (this.mouseButtonsPressed & 4) button = 2 + 32; // Right motion = 34
+    else button = 3 + 32; // No button motion = 35
 
     this.sendMouseEvent(button, cell.col, cell.row, false, event);
   }
@@ -907,130 +1088,6 @@ export class InputHandler {
   }
 
   /**
-   * Emit paste data with bracketed paste support
-   */
-  private emitPasteData(text: string): void {
-    const hasBracketedPaste = this.getModeCallback?.(2004) ?? false;
-
-    if (hasBracketedPaste) {
-      this.onDataCallback('\x1b[200~' + text + '\x1b[201~');
-    } else {
-      this.onDataCallback(text);
-    }
-  }
-
-  /**
-   * Record keydown data for beforeinput de-duplication
-   */
-  private recordKeyDownData(data: string): void {
-    this.lastKeyDownData = data;
-    this.lastKeyDownTime = this.getNow();
-  }
-
-  /**
-   * Record paste data for beforeinput de-duplication
-   */
-  private recordPasteData(data: string, source: 'paste' | 'beforeinput'): void {
-    this.lastPasteData = data;
-    this.lastPasteTime = this.getNow();
-    this.lastPasteSource = source;
-  }
-
-  /**
-   * Check if beforeinput should be ignored due to a recent keydown
-   */
-  private shouldIgnoreBeforeInput(data: string): boolean {
-    if (!this.lastKeyDownData) {
-      return false;
-    }
-    const now = this.getNow();
-    const isDuplicate =
-      now - this.lastKeyDownTime < InputHandler.BEFORE_INPUT_IGNORE_MS &&
-      this.lastKeyDownData === data;
-    this.lastKeyDownData = null;
-    return isDuplicate;
-  }
-
-  /**
-   * Check if beforeinput text should be ignored due to a recent composition end
-   */
-  private shouldIgnoreBeforeInputFromComposition(data: string): boolean {
-    if (!this.lastCompositionData) {
-      return false;
-    }
-    const now = this.getNow();
-    const isDuplicate =
-      now - this.lastCompositionTime < InputHandler.BEFORE_INPUT_IGNORE_MS &&
-      this.lastCompositionData === data;
-    if (isDuplicate) {
-      this.lastCompositionData = null;
-    }
-    return isDuplicate;
-  }
-
-  /**
-   * Check if composition end should be ignored due to a recent beforeinput text
-   */
-  private shouldIgnoreCompositionEnd(data: string): boolean {
-    if (!this.lastBeforeInputData) {
-      return false;
-    }
-    const now = this.getNow();
-    const isDuplicate =
-      now - this.lastBeforeInputTime < InputHandler.BEFORE_INPUT_IGNORE_MS &&
-      this.lastBeforeInputData === data;
-    if (isDuplicate) {
-      this.lastBeforeInputData = null;
-    }
-    return isDuplicate;
-  }
-
-  /**
-   * Record beforeinput text for composition de-duplication
-   */
-  private recordBeforeInputData(data: string): void {
-    this.lastBeforeInputData = data;
-    this.lastBeforeInputTime = this.getNow();
-  }
-
-  /**
-   * Record composition end data for beforeinput de-duplication
-   */
-  private recordCompositionData(data: string): void {
-    this.lastCompositionData = data;
-    this.lastCompositionTime = this.getNow();
-  }
-
-  /**
-   * Check if paste should be ignored due to a recent paste event from another source
-   */
-  private shouldIgnorePasteEvent(data: string, source: 'paste' | 'beforeinput'): boolean {
-    if (!this.lastPasteData) {
-      return false;
-    }
-    if (this.lastPasteSource === source) {
-      return false;
-    }
-    const now = this.getNow();
-    const isDuplicate =
-      now - this.lastPasteTime < InputHandler.BEFORE_INPUT_IGNORE_MS && this.lastPasteData === data;
-    if (isDuplicate) {
-      this.lastPasteData = null;
-      this.lastPasteSource = null;
-    }
-    return isDuplicate;
-  }
-
-  /**
-   * Get current time in milliseconds
-   */
-  private getNow(): number {
-    return typeof performance !== 'undefined' && typeof performance.now === 'function'
-      ? performance.now()
-      : Date.now();
-  }
-
-  /**
    * Dispose the InputHandler and remove event listeners
    */
   dispose(): void {
@@ -1048,15 +1105,7 @@ export class InputHandler {
 
     if (this.pasteListener) {
       this.container.removeEventListener('paste', this.pasteListener);
-      if (this.inputElement && this.inputElement !== this.container) {
-        this.inputElement.removeEventListener('paste', this.pasteListener);
-      }
       this.pasteListener = null;
-    }
-
-    if (this.beforeInputListener && this.inputElement) {
-      this.inputElement.removeEventListener('beforeinput', this.beforeInputListener);
-      this.beforeInputListener = null;
     }
 
     if (this.compositionStartListener) {
@@ -1082,6 +1131,11 @@ export class InputHandler {
     if (this.mouseupListener) {
       this.container.removeEventListener('mouseup', this.mouseupListener);
       this.mouseupListener = null;
+    }
+
+    if (this.mouseupDocumentListener) {
+      document.removeEventListener('mouseup', this.mouseupDocumentListener);
+      this.mouseupDocumentListener = null;
     }
 
     if (this.mousemoveListener) {

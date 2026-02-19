@@ -22,7 +22,7 @@ import type { ITerminalAddon, ITerminalCore } from '../interfaces';
 const MINIMUM_COLS = 2;
 const MINIMUM_ROWS = 1;
 const DEFAULT_SCROLLBAR_WIDTH = 15; // Reserve space for future scrollback scrollbar
-const RESIZE_DEBOUNCE_MS = 100; // Debounce time for ResizeObserver
+const RESIZE_DEBOUNCE_MS = 50; // Debounce time for ResizeObserver (reduced from 100ms for better responsiveness)
 
 // ============================================================================
 // Types
@@ -44,6 +44,7 @@ export class FitAddon implements ITerminalAddon {
   private _lastCols?: number;
   private _lastRows?: number;
   private _isResizing: boolean = false;
+  private _pendingResize: boolean = false; // Track if resize was requested during _isResizing
 
   /**
    * Activate the addon (called by Terminal.loadAddon)
@@ -76,14 +77,24 @@ export class FitAddon implements ITerminalAddon {
   }
 
   /**
+   * Invalidate cached dimensions.
+   * Call this when font size or DPR changes to force recalculation.
+   */
+  public invalidateCache(): void {
+    this._lastCols = undefined;
+    this._lastRows = undefined;
+  }
+
+  /**
    * Fit the terminal to its container
    *
    * Calculates optimal dimensions and resizes the terminal.
    * Does nothing if dimensions cannot be calculated or haven't changed.
    */
   public fit(): void {
-    // Prevent re-entrant calls during resize
+    // Prevent re-entrant calls during resize - but track pending request
     if (this._isResizing) {
+      this._pendingResize = true;
       return;
     }
 
@@ -106,23 +117,29 @@ export class FitAddon implements ITerminalAddon {
       return;
     }
 
-    // Store dimensions before resize
-    this._lastCols = dims.cols;
-    this._lastRows = dims.rows;
-
     // Set flag to prevent re-entrant calls
     this._isResizing = true;
+    this._pendingResize = false;
 
     try {
       // Resize terminal
       if (terminal.resize && typeof terminal.resize === 'function') {
         terminal.resize(dims.cols, dims.rows);
+        // Store dimensions AFTER successful resize
+        this._lastCols = dims.cols;
+        this._lastRows = dims.rows;
       }
+    } catch (err) {
+      console.error('[FitAddon] fit() - resize failed:', err);
     } finally {
-      // Clear flag after a short delay to allow DOM to settle
-      setTimeout(() => {
-        this._isResizing = false;
-      }, 50);
+      // Clear flag immediately - no more setTimeout delay
+      this._isResizing = false;
+
+      // Process pending resize if any (using microtask to avoid stack overflow)
+      if (this._pendingResize) {
+        this._pendingResize = false;
+        queueMicrotask(() => this.fit());
+      }
     }
   }
 
@@ -216,16 +233,12 @@ export class FitAddon implements ITerminalAddon {
 
     // Create ResizeObserver that watches for external size changes
     this._resizeObserver = new ResizeObserver((entries) => {
-      // Ignore resize events while we're actively resizing
-      if (this._isResizing) {
-        return;
-      }
-
       // Only trigger if the observed element's content rect changed
       const entry = entries[0];
       if (!entry) return;
 
-      // Debounce resize events
+      // Debounce resize events - don't block based on _isResizing,
+      // let debounce handle rapid calls naturally
       if (this._resizeDebounceTimer) {
         clearTimeout(this._resizeDebounceTimer);
       }

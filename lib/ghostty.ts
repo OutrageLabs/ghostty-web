@@ -268,6 +268,15 @@ export class GhosttyTerminal {
   /** Cell pool for zero-allocation rendering */
   private cellPool: GhosttyCell[] = [];
 
+  /** Cached cursor object (reused to avoid GC) */
+  private cachedCursor: RenderStateCursor = {
+    x: 0, y: 0, viewportX: 0, viewportY: 0,
+    visible: true, blinking: false, style: 'block'
+  };
+
+  /** Cached dimensions object (reused to avoid GC) */
+  private cachedDimensions: { cols: number; rows: number } = { cols: 80, rows: 24 };
+
   constructor(
     exports: GhosttyWasmExports,
     memory: WebAssembly.Memory,
@@ -341,7 +350,12 @@ export class GhosttyTerminal {
 
   write(data: string | Uint8Array): void {
     const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+    if (bytes.length === 0) return; // Nothing to write
     const ptr = this.exports.ghostty_wasm_alloc_u8_array(bytes.length);
+    if (ptr < 0) {
+      console.error("[GhosttyTerminal] Failed to allocate memory for write");
+      return;
+    }
     new Uint8Array(this.memory.buffer).set(bytes, ptr);
     this.exports.ghostty_terminal_write(this.handle, ptr, bytes.length);
     this.exports.ghostty_wasm_free_u8_array(ptr, bytes.length);
@@ -393,15 +407,15 @@ export class GhosttyTerminal {
     // Call update() to ensure render state is fresh.
     // This is safe to call multiple times - dirty state persists until markClean().
     this.update();
-    return {
-      x: this.exports.ghostty_render_state_get_cursor_x(this.handle),
-      y: this.exports.ghostty_render_state_get_cursor_y(this.handle),
-      viewportX: this.exports.ghostty_render_state_get_cursor_x(this.handle),
-      viewportY: this.exports.ghostty_render_state_get_cursor_y(this.handle),
-      visible: this.exports.ghostty_render_state_get_cursor_visible(this.handle),
-      blinking: false, // TODO: Add blinking support
-      style: 'block', // TODO: Add style support
-    };
+    // PERFORMANCE: Reuse cached object to avoid GC pressure
+    const x = this.exports.ghostty_render_state_get_cursor_x(this.handle);
+    const y = this.exports.ghostty_render_state_get_cursor_y(this.handle);
+    this.cachedCursor.x = x;
+    this.cachedCursor.y = y;
+    this.cachedCursor.viewportX = x;
+    this.cachedCursor.viewportY = y;
+    this.cachedCursor.visible = this.exports.ghostty_render_state_get_cursor_visible(this.handle);
+    return this.cachedCursor;
   }
 
   /**
@@ -466,7 +480,9 @@ export class GhosttyTerminal {
     if (count < 0) return this.cellPool;
 
     // Parse cells into pool (reuses existing objects)
-    this.parseCellsIntoPool(this.viewportBufferPtr, totalCells);
+    // CRITICAL: Use 'count' not 'totalCells' - WASM may not fill entire buffer
+    this.parseCellsIntoPool(this.viewportBufferPtr, count);
+
     return this.cellPool;
   }
 
@@ -536,7 +552,10 @@ export class GhosttyTerminal {
 
   /** Get dimensions - for compatibility */
   getDimensions(): { cols: number; rows: number } {
-    return { cols: this._cols, rows: this._rows };
+    // PERFORMANCE: Reuse cached object to avoid GC pressure
+    this.cachedDimensions.cols = this._cols;
+    this.cachedDimensions.rows = this._rows;
+    return this.cachedDimensions;
   }
 
   /** Get number of scrollback lines (history, not including active screen) */
@@ -777,6 +796,126 @@ export class GhosttyTerminal {
     const codepoints = this.getScrollbackGrapheme(offset, col);
     if (!codepoints || codepoints.length === 0) return ' ';
     return String.fromCodePoint(...codepoints);
+  }
+
+  // ==========================================================================
+  // Palette / Colors API
+  // ==========================================================================
+
+  /**
+   * Set a single palette color (index 0-255).
+   * Call update() after changing palette to see effects in getViewport().
+   */
+  setPaletteColor(index: number, r: number, g: number, b: number): void {
+    this.exports.ghostty_terminal_set_palette_color(this.handle, index, r, g, b);
+  }
+
+  /**
+   * Set the default background color.
+   * @param rgb Color as 0xRRGGBB, or undefined to reset to terminal default
+   */
+  setBackgroundColor(rgb?: number): void {
+    this.exports.ghostty_terminal_set_background_color(this.handle, rgb ?? 0xFFFFFFFF);
+  }
+
+  /**
+   * Set the default foreground color.
+   * @param rgb Color as 0xRRGGBB, or undefined to reset to terminal default
+   */
+  setForegroundColor(rgb?: number): void {
+    this.exports.ghostty_terminal_set_foreground_color(this.handle, rgb ?? 0xFFFFFFFF);
+  }
+
+  /**
+   * Set the cursor color.
+   * @param rgb Color as 0xRRGGBB, or undefined to reset to terminal default
+   */
+  setCursorColor(rgb?: number): void {
+    this.exports.ghostty_terminal_set_cursor_color(this.handle, rgb ?? 0xFFFFFFFF);
+  }
+
+  /**
+   * Apply a complete terminal theme (ANSI palette + default colors).
+   * This sets all 16 ANSI colors + background/foreground/cursor.
+   * Call update() after to see effects.
+   */
+  setTheme(theme: {
+    black?: string;
+    red?: string;
+    green?: string;
+    yellow?: string;
+    blue?: string;
+    magenta?: string;
+    cyan?: string;
+    white?: string;
+    brightBlack?: string;
+    brightRed?: string;
+    brightGreen?: string;
+    brightYellow?: string;
+    brightBlue?: string;
+    brightMagenta?: string;
+    brightCyan?: string;
+    brightWhite?: string;
+    background?: string;
+    foreground?: string;
+    cursor?: string;
+  }): void {
+    // Helper to parse color string to RGB components
+    const parseColor = (color: string | undefined): [number, number, number] | null => {
+      if (!color) return null;
+      // Remove # if present
+      const hex = color.replace('#', '');
+      if (hex.length !== 6) return null;
+      const r = parseInt(hex.substring(0, 2), 16);
+      const g = parseInt(hex.substring(2, 4), 16);
+      const b = parseInt(hex.substring(4, 6), 16);
+      if (isNaN(r) || isNaN(g) || isNaN(b)) return null;
+      return [r, g, b];
+    };
+
+    // ANSI colors (indices 0-15)
+    const ansiColors: (string | undefined)[] = [
+      theme.black,        // 0
+      theme.red,          // 1
+      theme.green,        // 2
+      theme.yellow,       // 3
+      theme.blue,         // 4
+      theme.magenta,      // 5
+      theme.cyan,         // 6
+      theme.white,        // 7
+      theme.brightBlack,  // 8
+      theme.brightRed,    // 9
+      theme.brightGreen,  // 10
+      theme.brightYellow, // 11
+      theme.brightBlue,   // 12
+      theme.brightMagenta,// 13
+      theme.brightCyan,   // 14
+      theme.brightWhite,  // 15
+    ];
+
+    // Set palette colors
+    for (let i = 0; i < 16; i++) {
+      const rgb = parseColor(ansiColors[i]);
+      if (rgb) {
+        this.setPaletteColor(i, rgb[0], rgb[1], rgb[2]);
+      }
+    }
+
+    // Set default colors
+    const bg = parseColor(theme.background);
+    if (bg) {
+      this.setBackgroundColor((bg[0] << 16) | (bg[1] << 8) | bg[2]);
+    }
+
+    const fg = parseColor(theme.foreground);
+    if (fg) {
+      this.setForegroundColor((fg[0] << 16) | (fg[1] << 8) | fg[2]);
+    }
+
+    const cursor = parseColor(theme.cursor);
+    if (cursor) {
+      this.setCursorColor((cursor[0] << 16) | (cursor[1] << 8) | cursor[2]);
+    }
   }
 
   private invalidateBuffers(): void {
