@@ -500,10 +500,14 @@ export class Terminal implements ITerminalCore {
         },
 
         writeDebug: async (message: string) => {
-          try {
-            await invoke('debug_write_file', { message });
-          } catch (e) {
-            // Ignore errors (debug command may not be available)
+          if (typeof window !== 'undefined' && '__TAURI__' in window) {
+            try {
+              await invoke('debug_write_file', { message });
+            } catch (e) {
+              // Ignore errors (debug command may not be available)
+            }
+          } else {
+            console.debug('[terminal]', message);
           }
         },
         // Check if selection is active (don't send mouse events to PTY during selection)

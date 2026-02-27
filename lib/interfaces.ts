@@ -107,6 +107,9 @@ export interface ITerminalOptions {
   // Default: true (recommended for terminals)
   disableDeadKeys?: boolean;
 
+  // Renderer type (default: 'beamterm')
+  renderer?: 'beamterm';
+
   // Internal: Ghostty WASM instance (optional, for test isolation)
   // If not provided, uses the module-level instance from init()
   ghostty?: Ghostty;
